@@ -1,0 +1,6 @@
+# Local Maestro workflow state
+.workflow/
+
+# Python test/runtime caches
+__pycache__/
+*.py[cod]

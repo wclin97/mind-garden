@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""Fail-closed local filesystem boundary for the Mind Garden Skill.
+
+This module is intentionally the only product code permitted to touch a Vault.
+All public errors are stable codes and never include a user path or file content.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import difflib
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import PurePosixPath
+from typing import Any, Iterable, Mapping, Sequence
+
+CONFIG_VERSION = "mind-garden-local-config/1.0"
+VENDOR_COMMIT = "8ccef29ae8624eccc734e77ced4a6e54baf5d83a"
+EXPECTED_SKILLS = ("obsidian-cli", "obsidian-markdown", "obsidian-bases")
+EXPECTED_VENDOR_CONTRACTS = {
+    skill: {
+        "path": f"skills/{skill}/UPSTREAM_SKILL.md",
+        "upstream_path": f"skills/{skill}/SKILL.md",
+    }
+    for skill in EXPECTED_SKILLS
+}
+DEFAULT_LIMITS = {"max_files": 500, "max_bytes": 4 * 1024 * 1024, "max_matches": 500}
+ERROR_CODES = frozenset({
+    "CONFIG_MISSING", "CONFIG_INVALID", "UNSUPPORTED_SAFE_IO", "PATH_INVALID",
+    "PATH_ESCAPE", "SYMLINK_REJECTED", "SPECIAL_FILE_REJECTED", "NOT_FOUND",
+    "NOT_MARKDOWN", "INVALID_UTF8", "SCAN_LIMIT", "LINK_UNRESOLVED",
+    "LINK_AMBIGUOUS", "HASH_CONFLICT", "ALREADY_EXISTS", "CONFIRMATION_REQUIRED",
+    "VENDOR_INVALID",
+})
+
+
+class GuardFailure(Exception):
+    """A public, non-leaking failure from a guarded operation."""
+
+    def __init__(self, code: str, public_message: str | None = None) -> None:
+        if code not in ERROR_CODES:
+            raise ValueError("unknown GuardFailure code")
+        self.code = code
+        self.public_message = public_message or code.replace("_", " ").lower()
+        super().__init__(self.public_message)
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopeContext:
+    canonical_vault: str
+    canonical_scope: str
+    scope_vault_relative_posix: str
+    config_path: str
+    limits: Mapping[str, int] = dataclasses.field(default_factory=lambda: dict(DEFAULT_LIMITS))
+
+
+@dataclasses.dataclass(frozen=True)
+class NoteRecord:
+    vault_relative_path: str
+    scope_relative_path: str
+    sha256: str
+    text: str
+    frontmatter: Mapping[str, str]
+    links: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class GuardedTextRecord:
+    """A non-Markdown guarded text artifact, currently used for opt-in Bases."""
+    scope_relative_path: str
+    sha256: str
+    text: str
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkResolution:
+    raw: str
+    state: str
+    target_scope_relative_path: str | None = None
+    anchor: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Preview:
+    target_scope_relative_path: str
+    before_sha256: str | None
+    after_sha256: str
+    unified_diff: str
+    sources: tuple[tuple[str, str], ...]
+    proposed_text: str
+
+
+def _failure(code: str) -> GuardFailure:
+    return GuardFailure(code)
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _is_descendant(child: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath((child, parent)) == parent and child != parent
+    except ValueError:
+        return False
+
+
+def _supported_safe_io() -> bool:
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in getattr(os, "supports_dir_fd", set())
+    )
+
+
+def _require_safe_io() -> None:
+    if not _supported_safe_io():
+        raise _failure("UNSUPPORTED_SAFE_IO")
+
+
+def _validate_relative(value: str, *, allow_base: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value or "\x00" in value or any(ord(char) < 32 for char in value):
+        raise _failure("PATH_INVALID")
+    # Mind Garden uses portable POSIX vault-relative names; accepting backslashes
+    # would make Windows/UNC ambiguity possible even on a POSIX host.
+    if "\\" in value or value.startswith("/") or value.startswith("//"):
+        raise _failure("PATH_INVALID")
+    if re.match(r"^[A-Za-z]:", value) or value.startswith("\\\\?"):
+        raise _failure("PATH_INVALID")
+    pieces = value.split("/")
+    if any(not piece or piece in {".", ".."} for piece in pieces):
+        raise _failure("PATH_INVALID")
+    if not allow_base and not pieces:
+        raise _failure("PATH_INVALID")
+    return tuple(pieces)
+
+
+def _relative_posix(path: str, root: str) -> str:
+    rel = os.path.relpath(path, root)
+    if rel == "." or rel.startswith(".." + os.sep):
+        raise _failure("PATH_ESCAPE")
+    return rel.replace(os.sep, "/")
+
+
+def _lstat(path: str) -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        raise _failure("NOT_FOUND") from None
+    except OSError:
+        raise _failure("PATH_ESCAPE") from None
+
+
+def _assert_regular(st: os.stat_result) -> None:
+    if stat.S_ISLNK(st.st_mode):
+        raise _failure("SYMLINK_REJECTED")
+    if not stat.S_ISREG(st.st_mode):
+        raise _failure("SPECIAL_FILE_REJECTED")
+
+
+def _assert_directory(st: os.stat_result) -> None:
+    if stat.S_ISLNK(st.st_mode):
+        raise _failure("SYMLINK_REJECTED")
+    if not stat.S_ISDIR(st.st_mode):
+        raise _failure("SPECIAL_FILE_REJECTED")
+
+
+def _open_directory(path: str) -> int:
+    _require_safe_io()
+    st = _lstat(path)
+    _assert_directory(st)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise _failure("SYMLINK_REJECTED") from None
+    try:
+        opened = os.fstat(fd)
+        _assert_directory(opened)
+        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            raise _failure("PATH_ESCAPE")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _validate_context(ctx: ScopeContext) -> None:
+    _require_safe_io()
+    vault = os.path.realpath(ctx.canonical_vault)
+    scope = os.path.realpath(ctx.canonical_scope)
+    if vault != ctx.canonical_vault or scope != ctx.canonical_scope:
+        raise _failure("PATH_ESCAPE")
+    if not _is_descendant(scope, vault):
+        raise _failure("PATH_ESCAPE")
+    vault_fd = _open_directory(vault)
+    scope_fd = _open_directory(scope)
+    os.close(vault_fd)
+    os.close(scope_fd)
+
+
+def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str]:
+    """Open all existing parent directories using descriptor-relative no-follow."""
+    _validate_context(ctx)
+    fd = _open_directory(ctx.canonical_scope)
+    absolute = ctx.canonical_scope
+    try:
+        for part in parts:
+            try:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raise _failure("NOT_FOUND") from None
+            if stat.S_ISLNK(st.st_mode):
+                raise _failure("SYMLINK_REJECTED")
+            if not stat.S_ISDIR(st.st_mode):
+                raise _failure("SPECIAL_FILE_REJECTED")
+            try:
+                new_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise _failure("SYMLINK_REJECTED") from None
+            opened = os.fstat(new_fd)
+            if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                os.close(new_fd)
+                raise _failure("PATH_ESCAPE")
+            os.close(fd)
+            fd = new_fd
+            absolute = os.path.join(absolute, part)
+        if os.path.realpath(absolute) != absolute or not (absolute == ctx.canonical_scope or _is_descendant(absolute, ctx.canonical_scope)):
+            raise _failure("PATH_ESCAPE")
+        return fd, absolute
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _target_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str, str]:
+    if len(parts) == 1:
+        fd = _open_directory(ctx.canonical_scope)
+        return fd, ctx.canonical_scope, parts[0]
+    fd, parent = _walk_existing_parent(ctx, parts[:-1])
+    return fd, parent, parts[-1]
+
+
+def _check_leaf(parent_fd: int, leaf: str, *, must_exist: bool, regular: bool = True) -> os.stat_result | None:
+    try:
+        st = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if must_exist:
+            raise _failure("NOT_FOUND") from None
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise _failure("SYMLINK_REJECTED")
+    if regular:
+        _assert_regular(st)
+    return st
+
+
+def _require_markdown(scope_relative_path: str) -> None:
+    if not scope_relative_path.endswith(".md"):
+        raise _failure("NOT_MARKDOWN")
+
+
+def _canonical_scope_from_data(data: Mapping[str, Any], allow_create_scope: bool) -> ScopeContext:
+    _require_safe_io()
+    if not isinstance(data, Mapping) or set(data) - {"schema_version", "vault_path", "allowed_subdirectory", "limits"}:
+        raise _failure("CONFIG_INVALID")
+    if data.get("schema_version") != CONFIG_VERSION:
+        raise _failure("CONFIG_INVALID")
+    vault_path = data.get("vault_path")
+    scope_name = data.get("allowed_subdirectory")
+    if not isinstance(vault_path, str) or not os.path.isabs(vault_path):
+        raise _failure("CONFIG_INVALID")
+    try:
+        scope_parts = _validate_relative(scope_name)
+    except GuardFailure:
+        raise _failure("CONFIG_INVALID") from None
+    if not os.path.isdir(vault_path) or os.path.islink(vault_path):
+        raise _failure("CONFIG_INVALID")
+    vault = os.path.realpath(vault_path)
+    if not os.path.isdir(vault) or os.path.islink(vault):
+        raise _failure("CONFIG_INVALID")
+    vault_fd = _open_directory(vault)
+    try:
+        current_fd = vault_fd
+        current_path = vault
+        for index, part in enumerate(scope_parts):
+            try:
+                st = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not allow_create_scope:
+                    raise _failure("CONFIG_INVALID") from None
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                    st = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                except OSError:
+                    raise _failure("CONFIG_INVALID") from None
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                raise _failure("CONFIG_INVALID")
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd)
+            except OSError:
+                raise _failure("CONFIG_INVALID") from None
+            if current_fd != vault_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+            current_path = os.path.join(current_path, part)
+        scope = os.path.realpath(current_path)
+        if scope != current_path or not _is_descendant(scope, vault):
+            raise _failure("CONFIG_INVALID")
+    finally:
+        try:
+            if 'current_fd' in locals() and current_fd != vault_fd:
+                os.close(current_fd)
+        finally:
+            os.close(vault_fd)
+    limits = dict(DEFAULT_LIMITS)
+    supplied = data.get("limits", {})
+    if supplied:
+        if not isinstance(supplied, Mapping) or set(supplied) - set(DEFAULT_LIMITS):
+            raise _failure("CONFIG_INVALID")
+        for key, value in supplied.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise _failure("CONFIG_INVALID")
+            limits[key] = value
+    return ScopeContext(vault, scope, "/".join(scope_parts), "", limits)
+
+
+def validate_scope_config(config_data: Mapping[str, Any], allow_create_scope: bool = False) -> ScopeContext:
+    """Validate a supplied machine-local configuration without disclosing it."""
+    return _canonical_scope_from_data(config_data, allow_create_scope)
+
+
+def _configured_config_path() -> str:
+    """Select the machine-local config location without consulting a Skill install path."""
+    explicit = os.environ.get("MIND_GARDEN_CONFIG")
+    if explicit is not None:
+        if not os.path.isabs(explicit):
+            raise _failure("CONFIG_INVALID")
+        return explicit
+
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home is not None:
+        if not os.path.isabs(xdg_config_home):
+            raise _failure("CONFIG_INVALID")
+        return os.path.join(xdg_config_home, "mind-garden", "config.json")
+
+    home = os.path.expanduser("~")
+    if not os.path.isabs(home):
+        raise _failure("CONFIG_INVALID")
+    return os.path.join(home, ".config", "mind-garden", "config.json")
+
+
+def load_config() -> ScopeContext:
+    """Load only the explicitly configured local scope; no default Vault exists."""
+    path = _configured_config_path()
+    if not os.path.exists(path):
+        raise _failure("CONFIG_MISSING")
+    if not os.path.isfile(path):
+        raise _failure("CONFIG_INVALID")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise _failure("CONFIG_INVALID") from None
+    ctx = _canonical_scope_from_data(data, False)
+    return dataclasses.replace(ctx, config_path=path)
+
+
+def resolve_target(ctx: ScopeContext, scope_relative_path: str, purpose: str = "read", allow_missing_leaf: bool = False) -> str:
+    """Validate a scope-relative target without opening a user file for content."""
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, parent, leaf = _target_parent(ctx, parts)
+    try:
+        st = _check_leaf(parent_fd, leaf, must_exist=not allow_missing_leaf, regular=False)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            raise _failure("SYMLINK_REJECTED")
+        result = os.path.join(parent, leaf)
+        if os.path.realpath(parent) != parent or not _is_descendant(result, ctx.canonical_scope):
+            raise _failure("PATH_ESCAPE")
+        return result
+    finally:
+        os.close(parent_fd)
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not text.startswith("---\n"):
+        return result
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return result
+    for line in text[4:end].splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key.strip()):
+                result[key.strip()] = value.strip().strip("\"'")
+    return result
+
+
+def extract_wikilinks(text: str) -> tuple[str, ...]:
+    return tuple(match.group(1) for match in re.finditer(r"(?<!!)\[\[([^\]]+)\]\]", text))
+
+
+def _read_fd_utf8(fd: int, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
+    before = os.fstat(fd)
+    _assert_regular(before)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise _failure("SCAN_LIMIT")
+        chunks.append(chunk)
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+        raise _failure("HASH_CONFLICT")
+    return b"".join(chunks), after
+
+
+def read_markdown(ctx: ScopeContext, scope_relative_path: str) -> NoteRecord:
+    _require_markdown(scope_relative_path)
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        expected = _check_leaf(parent_fd, leaf, must_exist=True)
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError:
+            raise _failure("SYMLINK_REJECTED") from None
+        try:
+            raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
+        finally:
+            os.close(fd)
+        if (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino):
+            raise _failure("HASH_CONFLICT")
+    finally:
+        os.close(parent_fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _failure("INVALID_UTF8") from None
+    path = resolve_target(ctx, scope_relative_path)
+    return NoteRecord(
+        _relative_posix(path, ctx.canonical_vault), scope_relative_path,
+        sha256_bytes(raw), text, _parse_frontmatter(text), extract_wikilinks(text),
+    )
+
+
+def read_guarded_text(ctx: ScopeContext, scope_relative_path: str, allowed_suffixes: Sequence[str] = (".md", ".base")) -> GuardedTextRecord:
+    """Read a guarded UTF-8 text artifact without making it eligible for scanning."""
+    if not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
+        raise _failure("NOT_MARKDOWN")
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        expected = _check_leaf(parent_fd, leaf, must_exist=True)
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError:
+            raise _failure("SYMLINK_REJECTED") from None
+        try:
+            raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
+        finally:
+            os.close(fd)
+        if (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino):
+            raise _failure("HASH_CONFLICT")
+    finally:
+        os.close(parent_fd)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _failure("INVALID_UTF8") from None
+    return GuardedTextRecord(scope_relative_path, sha256_bytes(raw), text)
+
+
+def _exclusive_create_text(ctx: ScopeContext, scope_relative_path: str, utf8_text: str, allowed_suffixes: Sequence[str]) -> GuardedTextRecord:
+    if not isinstance(utf8_text, str) or not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
+        raise _failure("NOT_MARKDOWN")
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        if _check_leaf(parent_fd, leaf, must_exist=False) is not None:
+            raise _failure("ALREADY_EXISTS")
+        try:
+            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            raise _failure("ALREADY_EXISTS") from None
+        except OSError:
+            raise _failure("PATH_ESCAPE") from None
+        try:
+            payload = utf8_text.encode("utf-8")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+    record = read_guarded_text(ctx, scope_relative_path, allowed_suffixes)
+    if record.sha256 != sha256_text(utf8_text):
+        raise _failure("HASH_CONFLICT")
+    return record
+
+
+def exclusive_create_text(ctx: ScopeContext, scope_relative_path: str, utf8_text: str) -> GuardedTextRecord:
+    """Safely create a Markdown or opt-in Base text artifact and verify read-back."""
+    return _exclusive_create_text(ctx, scope_relative_path, utf8_text, (".md", ".base"))
+
+
+def patch_expected_text(ctx: ScopeContext, scope_relative_path: str, expected_sha256: str, replacement_text: str) -> GuardedTextRecord:
+    """Safely replace a Markdown or Base text artifact after a SHA-256 precondition."""
+    if not any(scope_relative_path.endswith(suffix) for suffix in (".md", ".base")):
+        raise _failure("NOT_MARKDOWN")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
+        raise _failure("HASH_CONFLICT")
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        expected_st = _check_leaf(parent_fd, leaf, must_exist=True)
+        try:
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError:
+            raise _failure("SYMLINK_REJECTED") from None
+        try:
+            raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
+            if (expected_st.st_dev, expected_st.st_ino) != (opened.st_dev, opened.st_ino) or sha256_bytes(raw) != expected_sha256:
+                raise _failure("HASH_CONFLICT")
+            payload = replacement_text.encode("utf-8")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+    record = read_guarded_text(ctx, scope_relative_path)
+    if record.sha256 != sha256_text(replacement_text):
+        raise _failure("HASH_CONFLICT")
+    return record
+
+
+def _scanned_record(ctx: ScopeContext, path: str, scope_relative: str, max_bytes: int) -> NoteRecord:
+    # Resolve via the same descriptor/no-follow target boundary before content read.
+    return read_markdown(ctx, scope_relative)
+
+
+def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, max_bytes: int | None = None, max_matches: int | None = None) -> list[NoteRecord]:
+    """Bounded lexical scan of regular UTF-8 Markdown below the selected scope only."""
+    _validate_context(ctx)
+    if not isinstance(query, str) or not query:
+        raise _failure("PATH_INVALID")
+    file_cap = min(max_files or int(ctx.limits["max_files"]), int(ctx.limits["max_files"]))
+    byte_cap = min(max_bytes or int(ctx.limits["max_bytes"]), int(ctx.limits["max_bytes"]))
+    match_cap = min(max_matches or int(ctx.limits["max_matches"]), int(ctx.limits["max_matches"]))
+    matches: list[NoteRecord] = []
+    files_seen = 0
+    bytes_seen = 0
+    stack: list[tuple[str, str]] = [(ctx.canonical_scope, "")]
+    needle = query.casefold()
+    while stack:
+        directory, relative_prefix = stack.pop()
+        directory_fd = _open_directory(directory)
+        try:
+            entries = sorted(list(os.scandir(directory_fd)), key=lambda entry: entry.name)
+            for entry in entries:
+                name = entry.name
+                rel = f"{relative_prefix}/{name}" if relative_prefix else name
+                try:
+                    st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append((os.path.join(directory, name), rel))
+                    continue
+                if not stat.S_ISREG(st.st_mode) or not name.endswith(".md"):
+                    continue
+                files_seen += 1
+                if files_seen > file_cap:
+                    raise _failure("SCAN_LIMIT")
+                bytes_seen += st.st_size
+                if bytes_seen > byte_cap:
+                    raise _failure("SCAN_LIMIT")
+                record = _scanned_record(ctx, os.path.join(directory, name), rel, byte_cap)
+                if needle in record.text.casefold():
+                    matches.append(record)
+                    if len(matches) > match_cap:
+                        raise _failure("SCAN_LIMIT")
+        finally:
+            os.close(directory_fd)
+    return sorted(matches, key=lambda record: record.scope_relative_path)
+
+
+def _split_wikilink(raw: str) -> tuple[str, str | None]:
+    if not isinstance(raw, str) or not raw or raw.startswith("!") or "://" in raw:
+        raise _failure("LINK_UNRESOLVED")
+    raw_target = raw.split("|", 1)[0].strip()
+    if not raw_target or raw_target.startswith("#"):
+        raise _failure("LINK_UNRESOLVED")
+    if "#" in raw_target:
+        target, anchor = raw_target.split("#", 1)
+        if not anchor:
+            raise _failure("LINK_UNRESOLVED")
+        anchor = "#" + anchor
+    else:
+        target, anchor = raw_target, None
+    if target.endswith(".md") or target.startswith("/") or "\\" in target or ".." in target.split("/"):
+        raise _failure("LINK_UNRESOLVED")
+    return target, anchor
+
+
+def _anchor_exists(text: str, anchor: str) -> bool:
+    needle = anchor[1:]
+    if needle.startswith("^"):
+        return bool(re.search(r"(?:^|\s)" + re.escape(needle) + r"(?:\s|$)", text, re.MULTILINE))
+    headings = re.findall(r"^#{1,6}\s+(.+?)\s*#*\s*$", text, re.MULTILINE)
+    return needle.casefold() in {item.casefold() for item in headings}
+
+
+def resolve_wikilink(ctx: ScopeContext, source_note: NoteRecord | str, raw_link: str, known_notes: Iterable[NoteRecord]) -> LinkResolution:
+    """Resolve only fully-qualified in-scope, already scanned Markdown links."""
+    try:
+        target, anchor = _split_wikilink(raw_link)
+    except GuardFailure:
+        return LinkResolution(raw_link, "unresolved")
+    expected_prefix = ctx.scope_vault_relative_posix + "/"
+    if not target.startswith(expected_prefix):
+        return LinkResolution(raw_link, "unresolved")
+    wanted = target + ".md"
+    candidates = [note for note in known_notes if note.vault_relative_path == wanted]
+    if len(candidates) != 1:
+        return LinkResolution(raw_link, "ambiguous" if len(candidates) > 1 else "unresolved")
+    candidate = candidates[0]
+    if anchor and not _anchor_exists(candidate.text, anchor):
+        return LinkResolution(raw_link, "unresolved")
+    return LinkResolution(raw_link, "resolved", candidate.scope_relative_path, anchor)
+
+
+def backlinks(ctx: ScopeContext, target_scope_relative_path: str, known_notes: Iterable[NoteRecord]) -> list[NoteRecord]:
+    target = next((note for note in known_notes if note.scope_relative_path == target_scope_relative_path), None)
+    if target is None:
+        raise _failure("NOT_FOUND")
+    result: list[NoteRecord] = []
+    for note in known_notes:
+        for raw in note.links:
+            resolved = resolve_wikilink(ctx, note, raw, known_notes)
+            if resolved.state == "resolved" and resolved.target_scope_relative_path == target_scope_relative_path:
+                result.append(note)
+                break
+    return sorted(result, key=lambda note: note.scope_relative_path)
+
+
+def make_preview(target_scope_relative_path: str, proposed_text: str, before_text: str | None = None, sources: Iterable[NoteRecord] = ()) -> Preview:
+    before = before_text or ""
+    diff = "".join(difflib.unified_diff(
+        before.splitlines(keepends=True), proposed_text.splitlines(keepends=True),
+        fromfile="before", tofile="after",
+    ))
+    return Preview(
+        target_scope_relative_path, sha256_text(before_text) if before_text is not None else None,
+        sha256_text(proposed_text), diff,
+        tuple((source.scope_relative_path, source.sha256) for source in sources), proposed_text,
+    )
+
+
+def exclusive_create(ctx: ScopeContext, scope_relative_path: str, utf8_text: str) -> NoteRecord:
+    _require_markdown(scope_relative_path)
+    if not isinstance(utf8_text, str):
+        raise _failure("INVALID_UTF8")
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        if _check_leaf(parent_fd, leaf, must_exist=False) is not None:
+            raise _failure("ALREADY_EXISTS")
+        try:
+            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            raise _failure("ALREADY_EXISTS") from None
+        except OSError:
+            raise _failure("PATH_ESCAPE") from None
+        try:
+            payload = utf8_text.encode("utf-8")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+    record = read_markdown(ctx, scope_relative_path)
+    if record.sha256 != sha256_text(utf8_text):
+        raise _failure("HASH_CONFLICT")
+    return record
+
+
+def patch_expected(ctx: ScopeContext, scope_relative_path: str, expected_sha256: str, replacement_text: str) -> NoteRecord:
+    _require_markdown(scope_relative_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
+        raise _failure("HASH_CONFLICT")
+    parts = _validate_relative(scope_relative_path)
+    parent_fd, _, leaf = _target_parent(ctx, parts)
+    try:
+        expected_st = _check_leaf(parent_fd, leaf, must_exist=True)
+        try:
+            fd = os.open(leaf, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError:
+            raise _failure("SYMLINK_REJECTED") from None
+        try:
+            raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
+            if (expected_st.st_dev, expected_st.st_ino) != (opened.st_dev, opened.st_ino) or sha256_bytes(raw) != expected_sha256:
+                raise _failure("HASH_CONFLICT")
+            payload = replacement_text.encode("utf-8")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+    record = read_markdown(ctx, scope_relative_path)
+    if record.sha256 != sha256_text(replacement_text):
+        raise _failure("HASH_CONFLICT")
+    return record
+
+
+def move_expected(ctx: ScopeContext, from_scope_relative_path: str, to_scope_relative_path: str, expected_sha256: str) -> NoteRecord:
+    """Move a regular Markdown file only if its content still matches the preview hash."""
+    _require_markdown(from_scope_relative_path)
+    _require_markdown(to_scope_relative_path)
+    source = read_markdown(ctx, from_scope_relative_path)
+    if source.sha256 != expected_sha256:
+        raise _failure("HASH_CONFLICT")
+    source_parts, dest_parts = _validate_relative(from_scope_relative_path), _validate_relative(to_scope_relative_path)
+    source_fd, _, source_leaf = _target_parent(ctx, source_parts)
+    dest_fd, _, dest_leaf = _target_parent(ctx, dest_parts)
+    try:
+        if _check_leaf(dest_fd, dest_leaf, must_exist=False) is not None:
+            raise _failure("ALREADY_EXISTS")
+        # Validate source once more immediately before rename; the old fd remains
+        # descriptor-bound and both parents were opened with O_NOFOLLOW.
+        _check_leaf(source_fd, source_leaf, must_exist=True)
+        try:
+            os.rename(source_leaf, dest_leaf, src_dir_fd=source_fd, dst_dir_fd=dest_fd)
+        except OSError:
+            raise _failure("HASH_CONFLICT") from None
+    finally:
+        os.close(source_fd)
+        os.close(dest_fd)
+    moved = read_markdown(ctx, to_scope_relative_path)
+    if moved.sha256 != expected_sha256:
+        raise _failure("HASH_CONFLICT")
+    return moved
+
+
+def build_wikilink(vault_root_relative_extensionless: str, display: str) -> str:
+    parts = _validate_relative(vault_root_relative_extensionless)
+    if len(parts) < 2 or vault_root_relative_extensionless.endswith(".md"):
+        raise _failure("LINK_UNRESOLVED")
+    if any(any(char in part for char in "[]|#") for part in parts):
+        raise _failure("LINK_UNRESOLVED")
+    if not isinstance(display, str) or not display:
+        raise _failure("LINK_UNRESOLVED")
+    escaped = display.replace("\\", "\\\\").replace("|", "\\|").replace("]", "\\]")
+    return f"[[{vault_root_relative_extensionless}|{escaped}]]"
+
+
+def _literal_fence(original: str) -> str:
+    longest = max((len(match.group(0)) for match in re.finditer(r"`+", original)), default=2)
+    return "`" * max(3, longest + 1)
+
+
+def render_capture(note_id: str, original: str, created_at: str) -> str:
+    if not re.fullmatch(r"mg-[a-z0-9-]+", note_id):
+        raise _failure("PATH_INVALID")
+    fence = _literal_fence(original)
+    return (
+        "---\nkind: mind-garden-capture\nid: " + note_id + "\nstatus: open\ncreated_at: " + created_at + "\n---\n\n"
+        "# Capture " + note_id + "\n\n"
+        "## Original expression (literal; do not rewrite)\n\n" + fence + "\n" + original + "\n" + fence + "\n\n"
+        "<!-- mind-garden:connections:start -->\n<!-- mind-garden:connections:end -->\n"
+    )
+
+
+def original_expression_digest(text: str) -> str:
+    start = text.find("## Original expression (literal; do not rewrite)\n\n")
+    if start < 0:
+        raise _failure("PATH_INVALID")
+    marker_end = text.find("\n<!-- mind-garden:connections:start -->", start)
+    if marker_end < 0:
+        raise _failure("PATH_INVALID")
+    return sha256_text(text[start:marker_end])
+
+
+def render_derivative(kind: str, note_id: str, title: str, body: str, sources: Sequence[NoteRecord], created_at: str) -> str:
+    if kind not in {"development", "distillation"} or not sources:
+        raise _failure("PATH_INVALID")
+    links = "\n".join(f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} (sha256: `{note.sha256}`)" for note in sources)
+    return (
+        f"---\nkind: mind-garden-{kind}\nid: {note_id}\ncreated_at: {created_at}\n"
+        f"derived_from:\n{''.join(f'  - {note.vault_relative_path}\n' for note in sources)}---\n\n"
+        f"# {title}\n\n## Sources\n{links}\n\n## {kind.title()}\n\n{body}\n"
+    )
+
+
+def patch_managed_connections(original_text: str, connection_links: Sequence[str]) -> str:
+    before_digest = original_expression_digest(original_text)
+    start = "<!-- mind-garden:connections:start -->"
+    end = "<!-- mind-garden:connections:end -->"
+    first, sep, remainder = original_text.partition(start)
+    managed, sep2, suffix = remainder.partition(end)
+    if not sep or not sep2:
+        raise _failure("PATH_INVALID")
+    for link in connection_links:
+        if not link.startswith("[[") or not link.endswith("]]" ):
+            raise _failure("LINK_UNRESOLVED")
+    rendered = "\n".join(f"- {link}" for link in connection_links)
+    result = first + start + ("\n" + rendered if rendered else "") + "\n" + end + suffix
+    if original_expression_digest(result) != before_digest:
+        raise _failure("HASH_CONFLICT")
+    return result
+
+
+def render_review_snapshot(records: Sequence[NoteRecord], generated_at: str) -> str:
+    open_captures = [note for note in records if note.frontmatter.get("kind") == "mind-garden-capture" and note.frontmatter.get("status") == "open"]
+    lines = ["# Mind Garden Review", "", "> Non-authoritative Markdown snapshot. Regenerate after reviewing captures.", "", f"Generated: {generated_at}", ""]
+    if not open_captures:
+        return "\n".join(lines + ["No open in-scope captures.", ""])
+    for note in sorted(open_captures, key=lambda item: item.scope_relative_path):
+        lines.append(f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} — `{note.sha256}`")
+    return "\n".join(lines) + "\n"
+
+
+def render_review_base(scope_vault_relative_posix: str) -> str:
+    _validate_relative(scope_vault_relative_posix)
+    # YAML uses single-quoted scalar strings and exact folder/kind/status/.md filters.
+    folder = scope_vault_relative_posix.replace("\\", "\\\\").replace('"', '\\"').replace("'", "''")
+    return (
+        "filters:\n  and:\n"
+        f"    - 'file.inFolder(\"{folder}\")'\n"
+        "    - 'file.ext == \"md\"'\n"
+        "    - 'kind == \"mind-garden-capture\"'\n"
+        "    - 'status == \"open\"'\n"
+        "views:\n  - type: table\n    name: \"Open Mind Garden captures\"\n    order:\n      - file.name\n      - created_at\n      - status\n"
+    )
+
+
+def verify_vendor(skill_root: str) -> dict[str, Any]:
+    root = os.path.realpath(skill_root)
+    vendor = os.path.join(root, "vendor", "kepano-obsidian-skills")
+    manifest_path = os.path.join(vendor, "MANIFEST.json")
+    license_path = os.path.join(vendor, "LICENSE")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        with open(license_path, "r", encoding="utf-8") as handle:
+            license_text = handle.read()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise _failure("VENDOR_INVALID") from None
+    upstream = manifest.get("upstream", {})
+    if (
+        manifest.get("schema_version") != "vendored-skill-manifest/1.0"
+        or upstream.get("commit") != VENDOR_COMMIT
+        or upstream.get("license") != "MIT"
+        or "MIT License" not in license_text
+        or tuple(manifest.get("selected_skills", ())) != EXPECTED_SKILLS
+        or manifest.get("runtime_network_fetch") is not False
+        or manifest.get("includes_upstream_git_metadata") is not False
+    ):
+        raise _failure("VENDOR_INVALID")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise _failure("VENDOR_INVALID")
+
+    file_entries: dict[str, Mapping[str, Any]] = {}
+    for entry in files:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("path"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(entry.get("sha256", "")))
+        ):
+            raise _failure("VENDOR_INVALID")
+        try:
+            _validate_relative(entry["path"])
+        except GuardFailure:
+            raise _failure("VENDOR_INVALID") from None
+        if entry["path"] in file_entries:
+            raise _failure("VENDOR_INVALID")
+        file_entries[entry["path"]] = entry
+
+    for skill, contract in EXPECTED_VENDOR_CONTRACTS.items():
+        entry = file_entries.get(contract["path"])
+        if entry is None or entry.get("upstream_path") != contract["upstream_path"]:
+            raise _failure("VENDOR_INVALID")
+        if not os.path.isfile(os.path.join(vendor, *contract["path"].split("/"))):
+            raise _failure("VENDOR_INVALID")
+        # A discovery-named upstream copy would make this product expose an extra
+        # Skill entrypoint when installed under recursive host discovery.
+        if os.path.lexists(os.path.join(vendor, *contract["upstream_path"].split("/"))):
+            raise _failure("VENDOR_INVALID")
+
+    for entry in files:
+        path = os.path.join(vendor, *entry["path"].split("/"))
+        try:
+            with open(path, "rb") as handle:
+                actual = sha256_bytes(handle.read())
+        except OSError:
+            raise _failure("VENDOR_INVALID") from None
+        if actual != entry["sha256"]:
+            raise _failure("VENDOR_INVALID")
+    return {"ok": True, "commit": VENDOR_COMMIT, "verified_files": len(files), "skills": list(EXPECTED_SKILLS)}
+
+
+def _cli(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(description="Mind Garden guarded local boundary")
+    sub = parser.add_subparsers(dest="command", required=True)
+    verify = sub.add_parser("verify-vendor")
+    verify.add_argument(
+        "--skill-root", "--project-root", dest="skill_root", required=True,
+        help="Mind Garden Skill root (--project-root is a compatibility alias)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "verify-vendor":
+            print(json.dumps(verify_vendor(args.skill_root), sort_keys=True))
+            return 0
+    except GuardFailure as error:
+        print(json.dumps({"ok": False, "code": error.code}), file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli(sys.argv[1:]))

@@ -1,0 +1,53 @@
+{
+  "schema_version": "vendored-skill-manifest/1.0",
+  "upstream": {
+    "repository": "https://github.com/kepano/obsidian-skills.git",
+    "commit": "8ccef29ae8624eccc734e77ced4a6e54baf5d83a",
+    "license": "MIT",
+    "license_file": "LICENSE"
+  },
+  "selected_skills": [
+    "obsidian-cli",
+    "obsidian-markdown",
+    "obsidian-bases"
+  ],
+  "excluded_upstream_skills": {
+    "json-canvas": "No current Mind Garden requirement needs canvas manipulation.",
+    "knap": "No current Mind Garden requirement needs the Knap skill."
+  },
+  "runtime_network_fetch": false,
+  "includes_upstream_git_metadata": false,
+  "files": [
+    {
+      "path": "skills/obsidian-bases/references/FUNCTIONS_REFERENCE.md",
+      "sha256": "208fd63aead9bca1975626fea52605e6ab9434dc0529d923feb36b18b8877d3b"
+    },
+    {
+      "path": "skills/obsidian-bases/UPSTREAM_SKILL.md",
+      "upstream_path": "skills/obsidian-bases/SKILL.md",
+      "sha256": "c0037f20926c7d8591cdd040365e4c0e4c0c4146386a506f28f241faee9a27d9"
+    },
+    {
+      "path": "skills/obsidian-cli/UPSTREAM_SKILL.md",
+      "upstream_path": "skills/obsidian-cli/SKILL.md",
+      "sha256": "b54257cdc0e5d04488b35b0c797bfe427b24359f0848d3c73924dcacf8da6358"
+    },
+    {
+      "path": "skills/obsidian-markdown/references/CALLOUTS.md",
+      "sha256": "9912ec2e3f8711f65b8ceb82cc19cbffc5e6f8ccf2ab627e18926c522c383d8b"
+    },
+    {
+      "path": "skills/obsidian-markdown/references/EMBEDS.md",
+      "sha256": "63b6205507e28fb58cf200bc348a2b139e50ae739743e2e6316732148973cb7a"
+    },
+    {
+      "path": "skills/obsidian-markdown/references/PROPERTIES.md",
+      "sha256": "392953b5838c3ab3df135b5a914f100ae7b95e4501b6a2e5c8dc63da3ac7558b"
+    },
+    {
+      "path": "skills/obsidian-markdown/UPSTREAM_SKILL.md",
+      "upstream_path": "skills/obsidian-markdown/SKILL.md",
+      "sha256": "7ad72e1f0a9081ed325e76b6402ad5de50a00e63e2341fd403a92f147234a007"
+    }
+  ]
+}

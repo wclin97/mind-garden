@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mind-garden-local-config/1.0",
+  "title": "Mind Garden machine-local scope configuration",
+  "description": "An explicitly confirmed, machine-local authorization for one Obsidian Vault subdirectory. Runtime configuration is stored outside the Skill installation directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "vault_path", "allowed_subdirectory"],
+  "properties": {
+    "schema_version": {"const": "mind-garden-local-config/1.0"},
+    "vault_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute user-confirmed Vault root. Runtime realpath/no-follow validation is authoritative."
+    },
+    "allowed_subdirectory": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!\\.?$)[^\\\\]+$",
+      "description": "One non-root, POSIX-style Vault-relative scope; it cannot be empty, ., .., absolute, drive, UNC, or contain a backslash."
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_files": {"type": "integer", "minimum": 1, "maximum": 5000},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
+        "max_matches": {"type": "integer", "minimum": 1, "maximum": 5000}
+      }
+    }
+  },
+  "x-mind-garden-runtime-validation": [
+    "Configuration absence produces only a bootstrap prompt or unsaved draft; it never selects, scans, or reads a default Vault.",
+    "The Python scope guard canonicalizes Vault and scope with realpath, requires the scope to be a strict Vault descendant, and revalidates each operation.",
+    "Every target is a scope-relative path and all existing components use descriptor-relative lstat/fstat plus O_NOFOLLOW/O_DIRECTORY where supported. Unsupported trusted semantics fail closed.",
+    "Scope-external, symlinked, special, absolute, drive, UNC, ., and .. paths are rejected without exposing the external path or content."
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": "mind-garden-local-config/1.0",
+  "vault_path": "/absolute/path/to/your/Obsidian-Vault",
+  "allowed_subdirectory": "Mind Garden",
+  "limits": {
+    "max_files": 500,
+    "max_bytes": 4194304,
+    "max_matches": 500
+  }
+}
