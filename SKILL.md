@@ -7,6 +7,8 @@ description: Safely capture, develop, connect, distill, and review fragmentary i
 
 Mind Garden preserves authorship: it captures original thoughts literally, proposes
 connections rather than inventing them, and makes every persistent change explicit.
+It assesses whether an artifact deserves persistence from the complete relevant
+conversation and selected local context, not from a mechanical message classifier.
 It is a self-contained Skill at the repository root; the root `SKILL.md` is the only
 discoverable entrypoint, including for hosts that recursively discover `SKILL.md`
 below an install directory. No global Skill with a similar name is a fallback.
@@ -76,40 +78,81 @@ ambiguous names, external paths, and invalid anchors remain unresolved text.
    `.base`. Read back with the guard and verify the expected hash/structure before
    reporting the saved in-scope location.
 
+## Contextual value and note routing
+
+Before proposing a persistent artifact, the LLM considers the complete relevant
+conversation, the user's purpose, corrections, and any explicitly selected local
+context. It must not decide by message type, length, a fixed checklist, or message
+order. Small talk, a judgment, a confirmation, or a correction are common examples
+of low persistent value, but none is a hard exclusion: any can contain a durable
+insight in context.
+
+When a substantive thought is about the same topic, first merge it into the current
+unsaved draft. If an explicitly identified existing in-scope note is clearly about
+the same topic, propose an append to that note's managed development region instead
+of creating a duplicate; show the existing target and exact append, then require the
+normal fresh confirmation. Recommend a new capture only for a durable, independent
+thought. A bounded lexical scan can surface candidates, but it never selects or
+writes a target on its own, and a merely weak keyword overlap is not sufficient to
+call notes related.
+
 ## Modes
 
 ### capture
 
-Do not read Vault content. Create a draft `captures/<id>.md` whose **Original
-expression** is a dynamic fenced literal region containing the user's supplied text
-unchanged (including CJK, emoji, Markdown, fence runs, and leading/trailing
-whitespace). Preview the exact target/content without creating directories; on
-confirmation call `exclusive_create`, which may initialize only the missing direct
-`captures` parent as part of that same guarded operation. Read back and compare the
-original-region digest. Never rewrite or "improve" the original thought.
+Use this create operation only after contextual routing identifies a durable,
+independent thought. The create itself does not scan or read Vault content. Create a
+draft `captures/<id>.md` whose **Original expression** is a dynamic fenced literal
+region containing the user's supplied text unchanged (including CJK, emoji,
+Markdown, fence runs, and leading/trailing whitespace). A new capture also contains
+empty `mind-garden:development` and `mind-garden:connections` managed regions.
+Preview the exact target/content without creating directories; on confirmation call
+`exclusive_create`, which may initialize only the missing direct `captures` parent
+as part of that same guarded operation. Read back and compare the original-region
+digest. Never rewrite or "improve" the original thought.
 
 ### develop
 
-Use only sources the user explicitly selects from permitted scan results. Build a
-new `developments/<id>.md` with visible, path-qualified source links and each source
-SHA-256 provenance. Preview all source hashes and a new-file diff, then confirm and
-exclusive-create. If a source changes before writing, return an unsaved draft.
+Use only sources the user explicitly selects from permitted scan results. For a
+clearly same-topic existing note selected by the user, use
+`patch_managed_development` to append a dynamic-fenced literal **User contribution**
+and separately labelled **Agent development**; it preserves every existing managed
+region byte-for-byte and appends only at its tail. Missing or malformed markers in a
+legacy note fail closed rather than upgrading it. Otherwise build a new
+`developments/<id>.md` with visible, path-qualified source links and each source
+SHA-256 provenance. New development notes contain both managed regions. Preview all
+source hashes and the exact new-file or patch diff, then obtain fresh confirmation
+and make one guarded write. If a source changes before writing, return an unsaved
+draft.
 
 ### connect
 
-Read only user-selected in-scope notes and permitted scoped backlink candidates.
-Resolve only exact, path-qualified in-scope links. Preview source, target, reason,
-source hash, and unified diff. `patch_managed_connections` may change only the
-`mind-garden:connections` region; it must preserve the Original expression digest.
-Confirm, use `patch_expected`, and read back. Never infer a connection or rewrite
-source text.
+Read only user-selected in-scope source/target and optional scoped backlink candidates.
+A target must resolve from a fully qualified scope-internal wikilink. Preview reason,
+source/target hashes, and exact unified diff. `patch_managed_connections` may change
+only the `mind-garden:connections` region of a capture, development, or distillation;
+for a capture it also proves the Original expression digest is unchanged. Both
+managed-region marker pairs must already be present exactly once: a legacy note with
+a missing marker fails closed and is never implicitly upgraded. Confirm, use
+`patch_expected`, and read back. Never infer a connection or rewrite source text.
+
+### proactive connection proposals
+
+After a substantive artifact has been saved and verified, the Skill may run only a
+bounded in-scope lexical retrieval and offer at most three strong candidates. A
+candidate needs multiple specific lexical signals; a weak single-keyword match is not
+proposed. Each offer displays source, target, reason, both hashes, and the exact
+connection-region unified diff. It remains an unsaved proposal until the user gives a
+separate fresh confirmation for that exact connection preview; retrieval and saving
+the source never auto-create a connection.
 
 ### distill
 
-Use only explicitly selected sources. Create a separate
-`distillations/<id>.md`; never replace or compress the sources. Include complete
-source links and SHA-256 provenance, preview the multi-source diff, confirm, then
-exclusive-create and verify read-back.
+Use only explicitly selected sources. Create a separate `distillations/<id>.md` with
+complete provenance, visible path-qualified links, and both
+`mind-garden:development` and `mind-garden:connections` managed regions; never
+replace or compress the sources. Preview the multi-source diff, confirm, then
+exclusive-create and verify.
 
 ### review
 

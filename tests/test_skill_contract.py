@@ -43,6 +43,25 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("any directory inside the authorized scope tree", product.lower())
         self.assertIn("target leaf", product.lower())
 
+    def test_contextual_routing_and_managed_artifact_contract(self) -> None:
+        product = self.skill + "\n" + self.references
+        for phrase in (
+            "complete relevant\nconversation",
+            "message type, length, a fixed",
+            "hard exclusion",
+            "current\nunsaved draft",
+            "durable, independent",
+            "patch_managed_development",
+            "mind-garden:development:start",
+            "mind-garden:connections:start",
+            "legacy note fail",
+            "fresh confirmation",
+        ):
+            self.assertIn(phrase, product)
+        self.assertIn("at most three strong candidates", product)
+        self.assertIn("weak single-keyword match", product)
+        self.assertIn("never auto-create a connection", product)
+
     def test_static_capability_and_cli_audit(self) -> None:
         product = self.skill + "\n" + self.references
         for forbidden in ("obsidian search", "obsidian backlinks", "obsidian tags", "obsidian tasks", "daily:*", "file=", "MCP", "embedding", "database/index", "runtime dependency installation", "automatic Git"):

@@ -32,6 +32,13 @@ EXPECTED_VENDOR_CONTRACTS = {
 LIMIT_MAXIMA = {"max_files": 5000, "max_bytes": 64 * 1024 * 1024, "max_matches": 5000}
 DEFAULT_LIMITS = dict(LIMIT_MAXIMA)
 ARTIFACT_DIRECTORIES = frozenset({"captures", "developments", "distillations", "review"})
+MANAGED_DEVELOPMENT_START = "<!-- mind-garden:development:start -->"
+MANAGED_DEVELOPMENT_END = "<!-- mind-garden:development:end -->"
+MANAGED_CONNECTIONS_START = "<!-- mind-garden:connections:start -->"
+MANAGED_CONNECTIONS_END = "<!-- mind-garden:connections:end -->"
+MANAGED_NOTE_KINDS = frozenset({
+    "mind-garden-capture", "mind-garden-development", "mind-garden-distillation",
+})
 ERROR_CODES = frozenset({
     "CONFIG_MISSING", "CONFIG_INVALID", "UNSUPPORTED_SAFE_IO", "PATH_INVALID",
     "PATH_ESCAPE", "SYMLINK_REJECTED", "SPECIAL_FILE_REJECTED", "NOT_FOUND",
@@ -94,6 +101,19 @@ class Preview:
     after_sha256: str
     unified_diff: str
     sources: tuple[tuple[str, str], ...]
+    proposed_text: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ConnectionCandidate:
+    """A read-only, strong lexical connection proposal for a saved artifact."""
+    source_scope_relative_path: str
+    target_scope_relative_path: str
+    reason: str
+    source_sha256: str
+    target_sha256: str
+    connection_link: str
+    unified_diff: str
     proposed_text: str
 
 
@@ -860,19 +880,80 @@ def build_wikilink(vault_root_relative_extensionless: str, display: str) -> str:
 
 
 def _literal_fence(original: str) -> str:
+    if not isinstance(original, str):
+        raise _failure("INVALID_UTF8")
     longest = max((len(match.group(0)) for match in re.finditer(r"`+", original)), default=2)
     return "`" * max(3, longest + 1)
+
+
+def _top_level_marker_offsets(text: str, marker: str) -> list[int]:
+    """Find generated marker lines without mistaking literal fenced input for one."""
+    offsets: list[int] = []
+    active_fence: str | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        fence = re.fullmatch(r"(`{3,})", content)
+        if active_fence is not None:
+            if fence and len(fence.group(1)) >= len(active_fence):
+                active_fence = None
+        elif fence:
+            active_fence = fence.group(1)
+        elif content == marker:
+            offsets.append(offset)
+        offset += len(line)
+    return offsets
+
+
+def _managed_note_regions(text: str) -> tuple[str, dict[str, tuple[int, int]]]:
+    """Validate all generated managed regions before allowing a narrow patch."""
+    kind = _parse_frontmatter(text).get("kind")
+    if kind not in MANAGED_NOTE_KINDS:
+        raise _failure("PATH_INVALID")
+    markers = {
+        "development": (MANAGED_DEVELOPMENT_START, MANAGED_DEVELOPMENT_END),
+        "connections": (MANAGED_CONNECTIONS_START, MANAGED_CONNECTIONS_END),
+    }
+    regions: dict[str, tuple[int, int]] = {}
+    positions: list[int] = []
+    for name, (start_marker, end_marker) in markers.items():
+        starts = _top_level_marker_offsets(text, start_marker)
+        ends = _top_level_marker_offsets(text, end_marker)
+        if len(starts) != 1 or len(ends) != 1:
+            # Older or malformed notes are never upgraded implicitly by a patch.
+            raise _failure("PATH_INVALID")
+        start = starts[0]
+        end = ends[0]
+        if start >= end:
+            raise _failure("PATH_INVALID")
+        regions[name] = (start + len(start_marker), end)
+        positions.extend((start, end))
+    if positions != sorted(positions):
+        raise _failure("PATH_INVALID")
+    return kind, regions
+
+
+def _capture_original_end(text: str, start: int) -> int:
+    development = _top_level_marker_offsets(text, MANAGED_DEVELOPMENT_START)
+    connections = _top_level_marker_offsets(text, MANAGED_CONNECTIONS_START)
+    candidates = [offset for offset in development + connections if offset > start]
+    if not candidates:
+        raise _failure("PATH_INVALID")
+    return min(candidates)
 
 
 def render_capture(note_id: str, original: str, created_at: str) -> str:
     if not re.fullmatch(r"mg-[a-z0-9-]+", note_id):
         raise _failure("PATH_INVALID")
+    _utf8_payload(original)
+    _utf8_payload(created_at)
     fence = _literal_fence(original)
     return (
         "---\nkind: mind-garden-capture\nid: " + note_id + "\nstatus: open\ncreated_at: " + created_at + "\n---\n\n"
         "# Capture " + note_id + "\n\n"
         "## Original expression (literal; do not rewrite)\n\n" + fence + "\n" + original + "\n" + fence + "\n\n"
-        "<!-- mind-garden:connections:start -->\n<!-- mind-garden:connections:end -->\n"
+        + MANAGED_DEVELOPMENT_START + "\n" + MANAGED_DEVELOPMENT_END + "\n\n"
+        + MANAGED_CONNECTIONS_START + "\n" + MANAGED_CONNECTIONS_END + "\n"
     )
 
 
@@ -880,39 +961,167 @@ def original_expression_digest(text: str) -> str:
     start = text.find("## Original expression (literal; do not rewrite)\n\n")
     if start < 0:
         raise _failure("PATH_INVALID")
-    marker_end = text.find("\n<!-- mind-garden:connections:start -->", start)
-    if marker_end < 0:
-        raise _failure("PATH_INVALID")
-    return sha256_text(text[start:marker_end])
+    return sha256_text(text[start:_capture_original_end(text, start)])
 
 
 def render_derivative(kind: str, note_id: str, title: str, body: str, sources: Sequence[NoteRecord], created_at: str) -> str:
-    if kind not in {"development", "distillation"} or not sources:
+    if kind not in {"development", "distillation"} or not sources or not re.fullmatch(r"mg-[a-z0-9-]+", note_id):
         raise _failure("PATH_INVALID")
+    _utf8_payload(title)
+    _utf8_payload(body)
+    _utf8_payload(created_at)
     links = "\n".join(f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} (sha256: `{note.sha256}`)" for note in sources)
     return (
         f"---\nkind: mind-garden-{kind}\nid: {note_id}\ncreated_at: {created_at}\n"
         f"derived_from:\n{''.join(f'  - {note.vault_relative_path}\n' for note in sources)}---\n\n"
-        f"# {title}\n\n## Sources\n{links}\n\n## {kind.title()}\n\n{body}\n"
+        f"# {title}\n\n## Sources\n{links}\n\n## {kind.title()}\n\n"
+        + MANAGED_DEVELOPMENT_START + "\n### Agent contribution\n\n" + body + "\n"
+        + MANAGED_DEVELOPMENT_END + "\n\n"
+        + MANAGED_CONNECTIONS_START + "\n" + MANAGED_CONNECTIONS_END + "\n"
     )
 
 
-def patch_managed_connections(original_text: str, connection_links: Sequence[str]) -> str:
-    before_digest = original_expression_digest(original_text)
-    start = "<!-- mind-garden:connections:start -->"
-    end = "<!-- mind-garden:connections:end -->"
-    first, sep, remainder = original_text.partition(start)
-    managed, sep2, suffix = remainder.partition(end)
-    if not sep or not sep2:
-        raise _failure("PATH_INVALID")
-    for link in connection_links:
-        if not link.startswith("[[") or not link.endswith("]]" ):
-            raise _failure("LINK_UNRESOLVED")
-    rendered = "\n".join(f"- {link}" for link in connection_links)
-    result = first + start + ("\n" + rendered if rendered else "") + "\n" + end + suffix
-    if original_expression_digest(result) != before_digest:
+def _render_development_append(user_contribution: str, agent_development: str, created_at: str) -> str:
+    _utf8_payload(user_contribution)
+    _utf8_payload(agent_development)
+    _utf8_payload(created_at)
+    fence = _literal_fence(user_contribution)
+    return (
+        f"### Development contribution — {created_at}\n\n"
+        "#### User contribution (literal; do not rewrite)\n\n"
+        f"{fence}\n{user_contribution}\n{fence}\n\n"
+        "#### Agent development\n\n"
+        f"{agent_development}\n"
+    )
+
+
+def patch_managed_development(original_text: str, user_contribution: str, agent_development: str, created_at: str) -> str:
+    """Append a literal user contribution and separately marked agent development."""
+    kind, regions = _managed_note_regions(original_text)
+    before_digest = original_expression_digest(original_text) if kind == "mind-garden-capture" else None
+    _, development_end = regions["development"]
+    existing = original_text[regions["development"][0]:development_end]
+    separator = "" if existing.endswith("\n") else "\n"
+    result = original_text[:development_end] + separator + _render_development_append(
+        user_contribution, agent_development, created_at
+    ) + original_text[development_end:]
+    if before_digest is not None and original_expression_digest(result) != before_digest:
         raise _failure("HASH_CONFLICT")
     return result
+
+
+def _validate_connection_links(connection_links: Sequence[str]) -> None:
+    if isinstance(connection_links, str):
+        raise _failure("LINK_UNRESOLVED")
+    for link in connection_links:
+        if (
+            not isinstance(link, str)
+            or "\n" in link
+            or not link.startswith("[[")
+            or not link.endswith("]]")
+            or len(link) <= 4
+        ):
+            raise _failure("LINK_UNRESOLVED")
+
+
+def patch_managed_connections(original_text: str, connection_links: Sequence[str]) -> str:
+    """Replace only the connections region of a current managed artifact."""
+    kind, regions = _managed_note_regions(original_text)
+    before_digest = original_expression_digest(original_text) if kind == "mind-garden-capture" else None
+    _validate_connection_links(connection_links)
+    connections_start, connections_end = regions["connections"]
+    rendered = "\n".join(f"- {link}" for link in connection_links)
+    result = (
+        original_text[:connections_start]
+        + ("\n" + rendered + "\n" if rendered else "\n")
+        + original_text[connections_end:]
+    )
+    if before_digest is not None and original_expression_digest(result) != before_digest:
+        raise _failure("HASH_CONFLICT")
+    return result
+
+
+_LEXICAL_STOP_WORDS = frozenset({
+    "agent", "and", "capture", "captures", "connections", "contribution", "development", "distillation",
+    "do", "expression", "from", "garden", "idea", "literal", "mind", "not", "original", "rewrite",
+    "source", "sources", "the", "this", "user", "with",
+})
+
+
+def _substantive_lexical_terms(text: str) -> frozenset[str]:
+    """Extract only specific local terms, excluding managed/schema boilerplate."""
+    frontmatter_end = text.find("\n---\n", 4) if text.startswith("---\n") else -1
+    body = text[frontmatter_end + 5:] if frontmatter_end >= 0 else text
+    body = re.sub(r"<!--.*?-->", " ", body, flags=re.DOTALL)
+    body = re.sub(r"\[\[[^\]]+\]\]", " ", body)
+    body = re.sub(r"`[0-9a-f]{64}`", " ", body)
+    body = re.sub(r"\bmg-[a-z0-9-]+\b", " ", body)
+    terms: set[str] = set()
+    for phrase in re.findall(r"[\u3400-\u9fff]{2,}", body):
+        terms.update(phrase[index:index + 2] for index in range(len(phrase) - 1))
+    latin_body = re.sub(r"[\u3400-\u9fff]+", " ", body).casefold()
+    for term in re.findall(r"[a-z][a-z0-9'-]*", latin_body):
+        if len(term) >= 4 and term not in _LEXICAL_STOP_WORDS:
+            terms.add(term)
+    return frozenset(terms)
+
+
+def _existing_managed_connection_links(text: str, region: tuple[int, int]) -> tuple[str, ...]:
+    rendered = text[region[0]:region[1]]
+    links: list[str] = []
+    for line in rendered.splitlines():
+        if not line:
+            continue
+        if not line.startswith("- "):
+            raise _failure("PATH_INVALID")
+        links.append(line[2:])
+    _validate_connection_links(links)
+    return tuple(links)
+
+
+def propose_strong_connections(source: NoteRecord, candidates: Iterable[NoteRecord], max_candidates: int = 3) -> list[ConnectionCandidate]:
+    """Rank up to three strong lexical overlaps from an already bounded local scan.
+
+    A single shared keyword is deliberately insufficient. This function never writes;
+    callers must turn a selected proposal into a separately confirmed preview.
+    """
+    if isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or max_candidates < 1:
+        raise _failure("SCAN_LIMIT")
+    source_kind, source_regions = _managed_note_regions(source.text)
+    if source_kind not in MANAGED_NOTE_KINDS:
+        raise _failure("PATH_INVALID")
+    existing_links = _existing_managed_connection_links(source.text, source_regions["connections"])
+    source_terms = _substantive_lexical_terms(source.text)
+    ranked: list[tuple[int, str, ConnectionCandidate]] = []
+    seen_paths: set[str] = set()
+    for candidate in candidates:
+        if (
+            candidate.scope_relative_path == source.scope_relative_path
+            or candidate.scope_relative_path in seen_paths
+            or candidate.frontmatter.get("kind") not in MANAGED_NOTE_KINDS
+        ):
+            continue
+        seen_paths.add(candidate.scope_relative_path)
+        shared = source_terms.intersection(_substantive_lexical_terms(candidate.text))
+        if len(shared) < 2:
+            continue
+        terms = tuple(sorted(shared))
+        reason = "Shares multiple specific terms: " + ", ".join(terms[:3]) + "."
+        connection_link = build_wikilink(candidate.vault_relative_path[:-3], candidate.scope_relative_path)
+        if connection_link in existing_links:
+            continue
+        proposed_text = patch_managed_connections(source.text, (*existing_links, connection_link))
+        preview = make_preview(
+            source.scope_relative_path, proposed_text, source.text, (source, candidate)
+        )
+        proposal = ConnectionCandidate(
+            source.scope_relative_path, candidate.scope_relative_path, reason,
+            source.sha256, candidate.sha256, connection_link, preview.unified_diff,
+            preview.proposed_text,
+        )
+        ranked.append((len(shared), candidate.scope_relative_path, proposal))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in ranked[:min(max_candidates, 3)]]
 
 
 def render_review_snapshot(records: Sequence[NoteRecord], generated_at: str) -> str:

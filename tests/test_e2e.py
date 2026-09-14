@@ -34,6 +34,40 @@ class EndToEndFixtureTests(VaultFixture):
         self.assertIn("Non-authoritative", review_record.text)
         self.assertNotIn("confidential", review_record.text)
 
+    def test_proposes_only_strong_bounded_local_connections_after_save(self) -> None:
+        source = guard.exclusive_create(
+            self.ctx,
+            "captures/mg-source.md",
+            guard.render_capture("mg-source", "Resilient orchestration improves incident recovery.", "2026-09-13T00:00:00Z"),
+        )
+        strong = guard.exclusive_create(
+            self.ctx,
+            "captures/mg-strong.md",
+            guard.render_capture("mg-strong", "Incident recovery needs resilient orchestration.", "2026-09-13T00:00:00Z"),
+        )
+        weak = guard.exclusive_create(
+            self.ctx,
+            "captures/mg-weak.md",
+            guard.render_capture("mg-weak", "Resilient gardening catalog.", "2026-09-13T00:00:00Z"),
+        )
+
+        proposals = guard.propose_strong_connections(source, [source, weak, strong], max_candidates=99)
+        self.assertLessEqual(len(proposals), 3)
+        self.assertEqual([proposal.target_scope_relative_path for proposal in proposals], ["captures/mg-strong.md"])
+        proposal = proposals[0]
+        self.assertEqual(proposal.source_sha256, source.sha256)
+        self.assertEqual(proposal.target_sha256, strong.sha256)
+        self.assertIn("incident", proposal.reason)
+        self.assertIn("+", proposal.unified_diff)
+        self.assertIn(proposal.connection_link, proposal.proposed_text)
+        self.assertEqual(guard.read_markdown(self.ctx, source.scope_relative_path).sha256, source.sha256)
+
+        link = guard.build_wikilink(strong.vault_relative_path[:-3], "related recovery")
+        proposed_text = guard.patch_managed_connections(source.text, [link])
+        preview = guard.make_preview(source.scope_relative_path, proposed_text, source.text, [source, strong])
+        self.assertIn("+", preview.unified_diff)
+        self.assertEqual(preview.sources, ((source.scope_relative_path, source.sha256), (strong.scope_relative_path, strong.sha256)))
+
     def test_negative_paths_links_vendor_and_stale_write_return_safe_failures(self) -> None:
         record = guard.exclusive_create(self.ctx, "captures/a.md", guard.render_capture("mg-a", "raw", "2026-09-13T00:00:00Z"))
         for raw in ("Private/secret", "a", "https://example.test", "Mind Garden/captures/a#missing"):
