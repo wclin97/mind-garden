@@ -18,7 +18,30 @@ class ConfigContractTests(unittest.TestCase):
         self.assertEqual(schema["required"], ["schema_version", "vault_path", "allowed_subdirectory"])
         self.assertEqual(example["schema_version"], "mind-garden-local-config/1.0")
         self.assertIn("/absolute/path/to/", example["vault_path"])
+        expected_limits = {
+            key: definition["maximum"]
+            for key, definition in schema["properties"]["limits"]["properties"].items()
+        }
+        self.assertEqual(example["limits"], expected_limits)
+        self.assertEqual(guard.DEFAULT_LIMITS, expected_limits)
         self.assertNotIn("token", json.dumps(schema).lower())
+
+    def test_runtime_limits_enforce_schema_maxima(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = root / "Fixture Vault"
+            (vault / "Mind Garden").mkdir(parents=True)
+            base = {
+                "schema_version": guard.CONFIG_VERSION,
+                "vault_path": str(vault),
+                "allowed_subdirectory": "Mind Garden",
+            }
+            exact = dict(base, limits=dict(guard.LIMIT_MAXIMA))
+            self.assertEqual(dict(guard.validate_scope_config(exact).limits), guard.LIMIT_MAXIMA)
+            for key, maximum in guard.LIMIT_MAXIMA.items():
+                with self.subTest(key=key), self.assertRaises(guard.GuardFailure) as caught:
+                    guard.validate_scope_config(dict(base, limits={key: maximum + 1}))
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_root_contract_files_are_not_ignored(self) -> None:
         ignore_rules = (SKILL_ROOT / ".gitignore").read_text(encoding="utf-8")

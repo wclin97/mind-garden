@@ -36,11 +36,16 @@ reuse or infer a replacement Vault path. The root schema and example remain trac
 ## Boundary
 
 `scripts/scope_guard.py` is the sole product Vault-I/O boundary. It requires POSIX
-descriptor-relative no-follow semantics, canonicalizes
-the root and scope, rejects absolute/drive/UNC/`.`/`..`/symlink/special paths, and
-re-checks containment for every read, scan, create, patch, move, review, and Base
-operation. Errors use stable categories and never expose an outside path or its
-content.
+descriptor-relative no-follow semantics, canonicalizes the root and scope, rejects
+absolute/drive/UNC/`.`/`..`/symlink/special paths, and re-checks containment for
+every read, scan, create, patch, review, and Base operation. Creation additionally
+requires component-wide `O_NOFOLLOW_ANY`; there is no weaker fallback. During a guard
+operation, an uncooperative same-user process must not concurrently rename or replace
+the configured scope, its ancestors, any directory inside the authorized scope tree
+(including artifact parents), or the target leaf; public POSIX APIs cannot enforce
+that hostile namespace boundary. `move_expected` is disabled rather than pretending
+that POSIX rename can atomically compare a source hash. Errors use stable categories
+and never expose an outside path or its content.
 
 Retrieval is a bounded lexical scan of regular UTF-8 Markdown under the authorized
 scope only. Mind Garden never runs whole-Vault `obsidian search`, `backlinks`,
@@ -50,11 +55,11 @@ boundary.
 
 ## Persistence
 
-Every persistent action shows its target and preview. Existing-file changes, moves,
+Every persistent action shows its target and preview. Existing-file changes,
 reviews/Bases, and multi-source derivatives additionally show a unified diff and
 source SHA-256 values. A fresh explicit confirmation is required. Creates are
-exclusive; edits/moves use expected source hashes and a read-back verification;
-uncertain writes are never retried automatically.
+exclusive; edits use expected source hashes and read-back verification. Moves fail
+closed as unsupported; uncertain writes are never retried automatically.
 
 To revoke access, remove or invalidate the selected user configuration. This does
 not delete or modify any Vault note.

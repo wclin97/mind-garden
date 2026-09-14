@@ -30,9 +30,9 @@ global copy). They deliberately use the non-discovery filename
    invalid, request explicit authorization and return an unsaved draft; do not select,
    enumerate, read, or write a default/focused Vault.
 4. Use `scope_guard.py` for **all** Vault-facing reads, scans, link resolution,
-   creates, patches, moves, Markdown review snapshots, and optional Base targets.
-   It is the only product filesystem boundary. Do not substitute shell, editor,
-   Python snippets, or Obsidian CLI operations.
+   creates, patches, moves, fixed artifact-parent initialization, Markdown review
+   snapshots, and optional Base targets. It is the only product filesystem boundary.
+   Do not substitute shell, editor, Python snippets, or Obsidian CLI operations.
 5. Read [artifact-schema.md](references/artifact-schema.md) and the relevant mode
    in [mode-protocols.md](references/mode-protocols.md). Only bounded local lexical
    retrieval and scoped backlink parsing are permitted. Never issue `obsidian search`,
@@ -40,7 +40,13 @@ global copy). They deliberately use the non-discovery filename
    or a target-less/default Vault CLI.
 
 The guard rejects absolute targets, Windows drive/UNC/device forms, empty paths,
-`.`/`..`, symlinks, special files, and containment changes. Do not disclose an
+`.`/`..`, symlinks, special files, and containment changes detected during guarded
+path resolution. Creation requires component-wide `O_NOFOLLOW_ANY` support and
+resolves the final fixed artifact path from a fresh scope-root descriptor; there is
+no weaker fallback. During any operation, an uncooperative same-user process must
+not concurrently rename or replace the configured scope, its ancestors, any directory
+inside the authorized scope tree (including artifact parents), or the target leaf;
+public POSIX APIs cannot enforce that hostile namespace boundary. Do not disclose an
 external pathname or content in a response. Generated references must be unique,
 Vault-root-relative, extensionless, path-qualified wikilinks such as
 `[[Mind Garden/captures/mg-example|an idea]]`; bare titles, aliases, URLs, embeds,
@@ -53,15 +59,22 @@ ambiguous names, external paths, and invalid anchors remain unresolved text.
    `scan_markdown`, `read_markdown`, `resolve_wikilink`, or `backlinks` only.
 3. Display selected scope (without outside paths), target, bounded limits, source
    paths/hashes, and an unsaved proposed artifact.
-4. Display a preview for every write. For edits, moves, reviews/Bases, and
-   multi-source derivatives also display a unified diff and all source hashes.
+4. Display a preview for every write. For edits, reviews/Bases, and multi-source
+   derivatives also display a unified diff and all source hashes.
 5. Collect a fresh, unambiguous confirmation for this exact preview. Decline,
    missing confirmation, stale source, invalid target, unavailable capability, or
    vendor/config failure returns only the draft; do not write or auto-retry.
-6. Make exactly one guarded `exclusive_create`, `patch_expected`, `move_expected`,
-   `exclusive_create_text`, or `patch_expected_text` call. The text variants exist
-   only for a reviewed optional `.base`. Read back with the guard and verify the
-   expected hash/structure before reporting the saved in-scope location.
+6. Make exactly one guarded `exclusive_create`, `patch_expected`,
+   `exclusive_create_text`, or `patch_expected_text` call. As part of that same
+   confirmed create, the guard may descriptor-relatively create only a missing direct
+   parent named `captures`, `developments`, `distillations`, or `review`; preview
+   resolution never creates it, and reads/patches never initialize directories.
+   Creation fails closed with `UNSUPPORTED_SAFE_IO` when component-wide
+   `O_NOFOLLOW_ANY` is unavailable. `move_expected` remains a compatibility API but
+   always fails closed with `UNSUPPORTED_SAFE_IO` because POSIX rename has no atomic
+   expected-hash precondition. The text variants exist only for a reviewed optional
+   `.base`. Read back with the guard and verify the expected hash/structure before
+   reporting the saved in-scope location.
 
 ## Modes
 
@@ -70,9 +83,10 @@ ambiguous names, external paths, and invalid anchors remain unresolved text.
 Do not read Vault content. Create a draft `captures/<id>.md` whose **Original
 expression** is a dynamic fenced literal region containing the user's supplied text
 unchanged (including CJK, emoji, Markdown, fence runs, and leading/trailing
-whitespace). Preview the exact target/content; on confirmation call
-`exclusive_create`; read back and compare the original-region digest. Never rewrite
-or "improve" the original thought.
+whitespace). Preview the exact target/content without creating directories; on
+confirmation call `exclusive_create`, which may initialize only the missing direct
+`captures` parent as part of that same guarded operation. Read back and compare the
+original-region digest. Never rewrite or "improve" the original thought.
 
 ### develop
 

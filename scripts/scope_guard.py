@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -28,7 +29,9 @@ EXPECTED_VENDOR_CONTRACTS = {
     }
     for skill in EXPECTED_SKILLS
 }
-DEFAULT_LIMITS = {"max_files": 500, "max_bytes": 4 * 1024 * 1024, "max_matches": 500}
+LIMIT_MAXIMA = {"max_files": 5000, "max_bytes": 64 * 1024 * 1024, "max_matches": 5000}
+DEFAULT_LIMITS = dict(LIMIT_MAXIMA)
+ARTIFACT_DIRECTORIES = frozenset({"captures", "developments", "distillations", "review"})
 ERROR_CODES = frozenset({
     "CONFIG_MISSING", "CONFIG_INVALID", "UNSUPPORTED_SAFE_IO", "PATH_INVALID",
     "PATH_ESCAPE", "SYMLINK_REJECTED", "SPECIAL_FILE_REJECTED", "NOT_FOUND",
@@ -98,12 +101,36 @@ def _failure(code: str) -> GuardFailure:
     return GuardFailure(code)
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _utf8_payload(text: str) -> tuple[bytes, str]:
+    """Encode caller text before filesystem mutation and retain its digest."""
+    if not isinstance(text, str):
+        raise _failure("INVALID_UTF8")
+    try:
+        payload = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _failure("INVALID_UTF8") from None
+    return payload, sha256_bytes(payload)
+
+
+def sha256_text(text: str) -> str:
+    return _utf8_payload(text)[1]
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    """Write all bytes or fail rather than spinning on a short zero-byte write."""
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(fd, payload[offset:])
+        except OSError:
+            raise _failure("PATH_ESCAPE") from None
+        if not isinstance(written, int) or written <= 0 or written > len(payload) - offset:
+            raise _failure("PATH_ESCAPE")
+        offset += written
 
 
 def _is_descendant(child: str, parent: str) -> bool:
@@ -202,9 +229,14 @@ def _validate_context(ctx: ScopeContext) -> None:
     if not _is_descendant(scope, vault):
         raise _failure("PATH_ESCAPE")
     vault_fd = _open_directory(vault)
-    scope_fd = _open_directory(scope)
-    os.close(vault_fd)
-    os.close(scope_fd)
+    try:
+        scope_fd = _open_directory(scope)
+        try:
+            pass
+        finally:
+            os.close(scope_fd)
+    finally:
+        os.close(vault_fd)
 
 
 def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str]:
@@ -226,10 +258,13 @@ def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int,
                 new_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except OSError:
                 raise _failure("SYMLINK_REJECTED") from None
-            opened = os.fstat(new_fd)
-            if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            try:
+                opened = os.fstat(new_fd)
+                if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                    raise _failure("PATH_ESCAPE")
+            except Exception:
                 os.close(new_fd)
-                raise _failure("PATH_ESCAPE")
+                raise
             os.close(fd)
             fd = new_fd
             absolute = os.path.join(absolute, part)
@@ -239,6 +274,82 @@ def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int,
     except Exception:
         os.close(fd)
         raise
+
+
+def _require_create_safe_io() -> None:
+    """Creation needs component-wide no-follow, not merely leaf protection."""
+    _require_safe_io()
+    no_follow_any = getattr(os, "O_NOFOLLOW_ANY", None)
+    if not isinstance(no_follow_any, int) or no_follow_any <= 0:
+        raise _failure("UNSUPPORTED_SAFE_IO")
+
+
+def _validate_creation_parts(parts: Sequence[str], scope_relative_path: str) -> None:
+    """Restrict creating artifacts to one approved direct scope child."""
+    if len(parts) != 2 or parts[0] not in ARTIFACT_DIRECTORIES:
+        raise _failure("PATH_INVALID")
+    if scope_relative_path.endswith(".base") and parts[0] != "review":
+        raise _failure("PATH_INVALID")
+
+
+def _ensure_creation_parent(ctx: ScopeContext, name: str, *, create: bool) -> bool:
+    """Validate one approved direct parent and optionally create it from the scope root."""
+    _require_create_safe_io()
+    if name not in ARTIFACT_DIRECTORIES:
+        raise _failure("PATH_INVALID")
+    _validate_context(ctx)
+    scope_fd = _open_directory(ctx.canonical_scope)
+    try:
+        try:
+            st = os.stat(name, dir_fd=scope_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                return False
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=scope_fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise _failure("PATH_ESCAPE") from None
+            try:
+                st = os.stat(name, dir_fd=scope_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raise _failure("HASH_CONFLICT") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise _failure("SYMLINK_REJECTED")
+        if not stat.S_ISDIR(st.st_mode):
+            raise _failure("SPECIAL_FILE_REJECTED")
+        return True
+    finally:
+        os.close(scope_fd)
+
+
+def _exclusive_create_payload(ctx: ScopeContext, parts: Sequence[str], payload: bytes) -> None:
+    """Create parent/leaf in one descriptor-relative, component-safe open."""
+    _require_create_safe_io()
+    _ensure_creation_parent(ctx, parts[0], create=True)
+    scope_fd = _open_directory(ctx.canonical_scope)
+    try:
+        try:
+            fd = os.open(
+                "/".join(parts),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW_ANY,
+                0o600,
+                dir_fd=scope_fd,
+            )
+        except FileExistsError:
+            raise _failure("ALREADY_EXISTS") from None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise _failure("SYMLINK_REJECTED") from None
+            raise _failure("PATH_ESCAPE") from None
+    finally:
+        os.close(scope_fd)
+    try:
+        _write_all(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _target_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str, str]:
@@ -264,7 +375,7 @@ def _check_leaf(parent_fd: int, leaf: str, *, must_exist: bool, regular: bool = 
 
 
 def _require_markdown(scope_relative_path: str) -> None:
-    if not scope_relative_path.endswith(".md"):
+    if not isinstance(scope_relative_path, str) or not scope_relative_path.endswith(".md"):
         raise _failure("NOT_MARKDOWN")
 
 
@@ -322,12 +433,17 @@ def _canonical_scope_from_data(data: Mapping[str, Any], allow_create_scope: bool
         finally:
             os.close(vault_fd)
     limits = dict(DEFAULT_LIMITS)
-    supplied = data.get("limits", {})
-    if supplied:
-        if not isinstance(supplied, Mapping) or set(supplied) - set(DEFAULT_LIMITS):
+    if "limits" in data:
+        supplied = data["limits"]
+        if not isinstance(supplied, Mapping) or set(supplied) - set(LIMIT_MAXIMA):
             raise _failure("CONFIG_INVALID")
         for key, value in supplied.items():
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+                or value > LIMIT_MAXIMA[key]
+            ):
                 raise _failure("CONFIG_INVALID")
             limits[key] = value
     return ScopeContext(vault, scope, "/".join(scope_parts), "", limits)
@@ -377,6 +493,13 @@ def load_config() -> ScopeContext:
 def resolve_target(ctx: ScopeContext, scope_relative_path: str, purpose: str = "read", allow_missing_leaf: bool = False) -> str:
     """Validate a scope-relative target without opening a user file for content."""
     parts = _validate_relative(scope_relative_path)
+    if purpose == "create" and allow_missing_leaf:
+        _validate_creation_parts(parts, scope_relative_path)
+        if not _ensure_creation_parent(ctx, parts[0], create=False):
+            result = os.path.join(ctx.canonical_scope, *parts)
+            if not _is_descendant(result, ctx.canonical_scope):
+                raise _failure("PATH_ESCAPE")
+            return result
     parent_fd, parent, leaf = _target_parent(ctx, parts)
     try:
         st = _check_leaf(parent_fd, leaf, must_exist=not allow_missing_leaf, regular=False)
@@ -485,31 +608,14 @@ def read_guarded_text(ctx: ScopeContext, scope_relative_path: str, allowed_suffi
 
 
 def _exclusive_create_text(ctx: ScopeContext, scope_relative_path: str, utf8_text: str, allowed_suffixes: Sequence[str]) -> GuardedTextRecord:
-    if not isinstance(utf8_text, str) or not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
+    if not isinstance(scope_relative_path, str) or not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
         raise _failure("NOT_MARKDOWN")
+    payload, expected_sha256 = _utf8_payload(utf8_text)
     parts = _validate_relative(scope_relative_path)
-    parent_fd, _, leaf = _target_parent(ctx, parts)
-    try:
-        if _check_leaf(parent_fd, leaf, must_exist=False) is not None:
-            raise _failure("ALREADY_EXISTS")
-        try:
-            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
-        except FileExistsError:
-            raise _failure("ALREADY_EXISTS") from None
-        except OSError:
-            raise _failure("PATH_ESCAPE") from None
-        try:
-            payload = utf8_text.encode("utf-8")
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(fd, payload[offset:])
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    finally:
-        os.close(parent_fd)
+    _validate_creation_parts(parts, scope_relative_path)
+    _exclusive_create_payload(ctx, parts, payload)
     record = read_guarded_text(ctx, scope_relative_path, allowed_suffixes)
-    if record.sha256 != sha256_text(utf8_text):
+    if record.sha256 != expected_sha256:
         raise _failure("HASH_CONFLICT")
     return record
 
@@ -525,6 +631,7 @@ def patch_expected_text(ctx: ScopeContext, scope_relative_path: str, expected_sh
         raise _failure("NOT_MARKDOWN")
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
         raise _failure("HASH_CONFLICT")
+    payload, replacement_sha256 = _utf8_payload(replacement_text)
     parts = _validate_relative(scope_relative_path)
     parent_fd, _, leaf = _target_parent(ctx, parts)
     try:
@@ -537,19 +644,16 @@ def patch_expected_text(ctx: ScopeContext, scope_relative_path: str, expected_sh
             raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
             if (expected_st.st_dev, expected_st.st_ino) != (opened.st_dev, opened.st_ino) or sha256_bytes(raw) != expected_sha256:
                 raise _failure("HASH_CONFLICT")
-            payload = replacement_text.encode("utf-8")
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(fd, payload[offset:])
+            _write_all(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
     finally:
         os.close(parent_fd)
     record = read_guarded_text(ctx, scope_relative_path)
-    if record.sha256 != sha256_text(replacement_text):
+    if record.sha256 != replacement_sha256:
         raise _failure("HASH_CONFLICT")
     return record
 
@@ -559,14 +663,22 @@ def _scanned_record(ctx: ScopeContext, path: str, scope_relative: str, max_bytes
     return read_markdown(ctx, scope_relative)
 
 
+def _effective_scan_limit(name: str, requested: int | None, configured: int) -> int:
+    if requested is None:
+        return configured
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1 or requested > LIMIT_MAXIMA[name]:
+        raise _failure("SCAN_LIMIT")
+    return min(requested, configured)
+
+
 def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, max_bytes: int | None = None, max_matches: int | None = None) -> list[NoteRecord]:
     """Bounded lexical scan of regular UTF-8 Markdown below the selected scope only."""
     _validate_context(ctx)
     if not isinstance(query, str) or not query:
         raise _failure("PATH_INVALID")
-    file_cap = min(max_files or int(ctx.limits["max_files"]), int(ctx.limits["max_files"]))
-    byte_cap = min(max_bytes or int(ctx.limits["max_bytes"]), int(ctx.limits["max_bytes"]))
-    match_cap = min(max_matches or int(ctx.limits["max_matches"]), int(ctx.limits["max_matches"]))
+    file_cap = _effective_scan_limit("max_files", max_files, int(ctx.limits["max_files"]))
+    byte_cap = _effective_scan_limit("max_bytes", max_bytes, int(ctx.limits["max_bytes"]))
+    match_cap = _effective_scan_limit("max_matches", max_matches, int(ctx.limits["max_matches"]))
     matches: list[NoteRecord] = []
     files_seen = 0
     bytes_seen = 0
@@ -681,31 +793,12 @@ def make_preview(target_scope_relative_path: str, proposed_text: str, before_tex
 
 def exclusive_create(ctx: ScopeContext, scope_relative_path: str, utf8_text: str) -> NoteRecord:
     _require_markdown(scope_relative_path)
-    if not isinstance(utf8_text, str):
-        raise _failure("INVALID_UTF8")
+    payload, expected_sha256 = _utf8_payload(utf8_text)
     parts = _validate_relative(scope_relative_path)
-    parent_fd, _, leaf = _target_parent(ctx, parts)
-    try:
-        if _check_leaf(parent_fd, leaf, must_exist=False) is not None:
-            raise _failure("ALREADY_EXISTS")
-        try:
-            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
-        except FileExistsError:
-            raise _failure("ALREADY_EXISTS") from None
-        except OSError:
-            raise _failure("PATH_ESCAPE") from None
-        try:
-            payload = utf8_text.encode("utf-8")
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(fd, payload[offset:])
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    finally:
-        os.close(parent_fd)
+    _validate_creation_parts(parts, scope_relative_path)
+    _exclusive_create_payload(ctx, parts, payload)
     record = read_markdown(ctx, scope_relative_path)
-    if record.sha256 != sha256_text(utf8_text):
+    if record.sha256 != expected_sha256:
         raise _failure("HASH_CONFLICT")
     return record
 
@@ -714,6 +807,7 @@ def patch_expected(ctx: ScopeContext, scope_relative_path: str, expected_sha256:
     _require_markdown(scope_relative_path)
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
         raise _failure("HASH_CONFLICT")
+    payload, replacement_sha256 = _utf8_payload(replacement_text)
     parts = _validate_relative(scope_relative_path)
     parent_fd, _, leaf = _target_parent(ctx, parts)
     try:
@@ -726,50 +820,31 @@ def patch_expected(ctx: ScopeContext, scope_relative_path: str, expected_sha256:
             raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
             if (expected_st.st_dev, expected_st.st_ino) != (opened.st_dev, opened.st_ino) or sha256_bytes(raw) != expected_sha256:
                 raise _failure("HASH_CONFLICT")
-            payload = replacement_text.encode("utf-8")
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(fd, payload[offset:])
+            _write_all(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
     finally:
         os.close(parent_fd)
     record = read_markdown(ctx, scope_relative_path)
-    if record.sha256 != sha256_text(replacement_text):
+    if record.sha256 != replacement_sha256:
         raise _failure("HASH_CONFLICT")
     return record
 
 
 def move_expected(ctx: ScopeContext, from_scope_relative_path: str, to_scope_relative_path: str, expected_sha256: str) -> NoteRecord:
-    """Move a regular Markdown file only if its content still matches the preview hash."""
+    """Fail closed because POSIX rename has no expected-inode/hash precondition."""
     _require_markdown(from_scope_relative_path)
     _require_markdown(to_scope_relative_path)
-    source = read_markdown(ctx, from_scope_relative_path)
-    if source.sha256 != expected_sha256:
+    source_parts = _validate_relative(from_scope_relative_path)
+    dest_parts = _validate_relative(to_scope_relative_path)
+    _validate_creation_parts(source_parts, from_scope_relative_path)
+    _validate_creation_parts(dest_parts, to_scope_relative_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
         raise _failure("HASH_CONFLICT")
-    source_parts, dest_parts = _validate_relative(from_scope_relative_path), _validate_relative(to_scope_relative_path)
-    source_fd, _, source_leaf = _target_parent(ctx, source_parts)
-    dest_fd, _, dest_leaf = _target_parent(ctx, dest_parts)
-    try:
-        if _check_leaf(dest_fd, dest_leaf, must_exist=False) is not None:
-            raise _failure("ALREADY_EXISTS")
-        # Validate source once more immediately before rename; the old fd remains
-        # descriptor-bound and both parents were opened with O_NOFOLLOW.
-        _check_leaf(source_fd, source_leaf, must_exist=True)
-        try:
-            os.rename(source_leaf, dest_leaf, src_dir_fd=source_fd, dst_dir_fd=dest_fd)
-        except OSError:
-            raise _failure("HASH_CONFLICT") from None
-    finally:
-        os.close(source_fd)
-        os.close(dest_fd)
-    moved = read_markdown(ctx, to_scope_relative_path)
-    if moved.sha256 != expected_sha256:
-        raise _failure("HASH_CONFLICT")
-    return moved
+    raise _failure("UNSUPPORTED_SAFE_IO")
 
 
 def build_wikilink(vault_root_relative_extensionless: str, display: str) -> str:

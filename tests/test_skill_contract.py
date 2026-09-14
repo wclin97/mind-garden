@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unittest
 
-from fixtures import SKILL_ROOT
+from fixtures import SKILL_ROOT, guard
 
 
 class SkillContractTests(unittest.TestCase):
@@ -29,6 +29,19 @@ class SkillContractTests(unittest.TestCase):
             self.assertIn(word, self.skill.lower())
         self.assertIn("Original expression", self.skill)
         self.assertIn("path-qualified", self.skill)
+
+    def test_fixed_artifact_parent_initialization_contract(self) -> None:
+        product = self.skill + "\n" + self.references
+        for directory in ("captures", "developments", "distillations", "review"):
+            self.assertIn(directory, guard.ARTIFACT_DIRECTORIES)
+        self.assertIn("preview target resolution never creates", product.lower())
+        self.assertIn("reads/patches never initialize", product.lower())
+        self.assertIn("missing direct", product.lower())
+        self.assertIn("move_expected", product)
+        self.assertIn("always fails closed", product.lower())
+        self.assertIn("O_NOFOLLOW_ANY", product)
+        self.assertIn("any directory inside the authorized scope tree", product.lower())
+        self.assertIn("target leaf", product.lower())
 
     def test_static_capability_and_cli_audit(self) -> None:
         product = self.skill + "\n" + self.references

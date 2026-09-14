@@ -2,17 +2,24 @@
 
 ## Layout and stable note types
 
-All persistent notes live inside the authorized scope only:
+All persistent notes live inside the authorized scope under the supported
+single-namespace-owner model. An uncooperative same-user process must not concurrently
+rename or replace the scope, its ancestors, an in-scope directory, or a target leaf
+during a guard operation because public POSIX APIs cannot enforce that hostile case:
 
 - `captures/<id>.md`
 - `developments/<id>.md`
 - `distillations/<id>.md`
 - `review/Mind Garden Review.md` and (opt-in) `review/Mind Garden Review.base`
 
-`<id>` is a stable `mg-` identifier. No mode deletes a note. Captures use frontmatter
-`kind: mind-garden-capture`, `id`, `status: open`, and `created_at`; derived notes
-use `kind: mind-garden-development` or `kind: mind-garden-distillation` and complete
-`derived_from` paths.
+`<id>` is a stable `mg-` identifier. No mode deletes a note. If one listed direct
+parent is missing, the confirmed exclusive create may create only that fixed parent
+descriptor-relatively as part of the same operation. Preview resolution does not
+create it, and reads/patches never initialize directories. `move_expected` is
+compatibility-only and always fails closed because POSIX rename cannot atomically
+compare the source hash. Captures use frontmatter `kind: mind-garden-capture`, `id`,
+`status: open`, and `created_at`; derived notes use `kind: mind-garden-development`
+or `kind: mind-garden-distillation` and complete `derived_from` paths.
 
 ## Literal capture invariant
 
@@ -46,9 +53,10 @@ unresolved text.
 
 `Preview` contains target, prior/proposed SHA-256, unified diff, source
 path/SHA-256 pairs, and proposed text. Every save requires fresh confirmation.
-Create uses exclusive creation; existing notes/moves use expected source hash; every
-successful write is immediately guarded-read and checked. A decline, conflict, or
-uncertain write has only an unsaved artifact draft.
+Create uses exclusive creation; existing-note patches use an expected source hash;
+every successful write is immediately guarded-read and checked. Moves are currently
+unsupported rather than approximated with a non-atomic rename. A decline, conflict,
+or uncertain write has only an unsaved artifact draft.
 
 ## Review projection
 

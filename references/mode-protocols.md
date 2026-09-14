@@ -2,15 +2,21 @@
 
 Each mode loads the exact local vendor contracts, verifies the offline manifest,
 loads the local scope through the guard, computes an unsaved draft, previews it, and
-obtains a fresh confirmation. Configuration/vendor/scope/confirmation failure,
-stale sources, invalid targets, and unsupported capabilities produce a non-leaking
-unsaved draft and no retry.
+obtains a fresh confirmation. Preview target resolution never creates directories.
+After confirmation, the same exclusive create call may initialize only its missing
+direct fixed artifact parent (`captures`, `developments`, `distillations`, or
+`review`); reads and patches never initialize directories. Creation requires
+component-wide `O_NOFOLLOW_ANY` and has no weaker fallback. `move_expected` always
+fails closed because POSIX rename cannot atomically enforce an expected source hash.
+Configuration/vendor/scope/confirmation failure, stale sources, invalid targets, and
+unsupported capabilities produce a non-leaking unsaved draft and no retry.
 
 ## capture
 
 Input is the user's exact expression. Do not scan or read the Vault. Render a dynamic
-literal-fenced `captures/<id>.md`, preview target/content, confirm, then guarded
-exclusive-create and verify the exact original-region digest on read-back.
+literal-fenced `captures/<id>.md`, preview target/content without creating its parent,
+confirm, then guarded exclusive-create (including the fixed `captures` parent only if
+missing) and verify the exact original-region digest on read-back.
 
 ## develop
 
