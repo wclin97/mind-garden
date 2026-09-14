@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import SKILL_ROOT, guard
+from tests.fixtures import SKILL_ROOT, guard
 
 
 class VendorContractTests(unittest.TestCase):

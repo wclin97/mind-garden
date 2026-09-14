@@ -24,7 +24,23 @@ All Vault I/O must pass through `scripts/scope_guard.py`:
   `read_markdown(ctx, path)`
 - `resolve_wikilink(ctx, source, raw, known_notes)` and `backlinks(...)`
 - `exclusive_create` and `exclusive_create_text` may initialize only a missing direct
-  parent in the fixed set `captures`, `developments`, `distillations`, and `review`
+  parent in the fixed text set `captures`, `developments`, `distillations`, and `review`
+- `plan_raster_attachment(payload, declared_mime, max_bytes)` validates only in-memory
+  PNG/JPEG/WebP bytes and deterministically plans `attachments/<sha256>.<ext>`
+- `ExternalSearchRequest`, `build_external_search_request(query, policy)`, and
+  `ExternalSearchRequest.as_host_payload()` are pure no-I/O request validation; the
+  payload has exactly local `query` and capped `max_results` fields
+- `validate_external_enrichment(..., search_request=...)` binds host-result provenance
+  to that independently retained local request
+- `read_attachment(ctx, target)` reads only content-addressed matching raster bytes;
+  text create/patch APIs cannot use `attachments`
+- `exclusive_create_development_bundle(ctx, development_path, development_text, attachments)`
+  validates every active embed before mutation, writes/reuses rasters, creates the
+  development last, and reports verified orphan attachments or potential (unverified)
+  orphan identities without deletion
+- **Guard-only persistence:** no host result, normal conversation, or model judgment
+  bypasses these guarded create/patch routes or the explicit mode/source/preview/
+  confirmation boundary
 - `patch_expected` / `patch_expected_text` for confirmed existing artifacts
 - `move_expected` is compatibility-only and always returns `UNSUPPORTED_SAFE_IO`
 
@@ -55,3 +71,17 @@ Generated wikilinks name a unique already-scanned target by vault-root-relative,
 extensionless, path-qualified path. Links that are bare titles, aliases, embeds,
 URLs, scope-external paths, duplicate targets, malformed paths, or invalid anchors
 remain unresolved. They cannot affect associations, backlinks, or review.
+
+## External boundary
+
+The only permitted outbound enrichment shape is the host-provided structured search
+request described in [external-enrichment.md](external-enrichment.md): a locally
+derived 2–6 word query (maximum 120 characters) plus a numeric result cap. No Vault
+path, filename, note ID, frontmatter, source hash, wikilink, Markdown, Original
+expression, or long copied note fragment crosses that boundary. The host is not a
+Vault authority: its URLs and metadata never become filesystem targets.
+
+Incoming source text and candidate bytes are untrusted. The guard accepts only
+validated bounded HTTPS metadata and raster content-addressed paths. It does not
+parse, execute, or upload external content; all Vault persistence still flows through
+this guard and still requires the normal confirmed preview.

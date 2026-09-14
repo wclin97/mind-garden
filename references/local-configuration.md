@@ -22,11 +22,16 @@ chooses a Vault by default. It does not print configuration or Vault paths.
 
 1. Ask the user for an absolute Vault root and one non-root directory inside it.
 2. Show the canonical Vault/scope and the limited operations this grants.
-3. After explicit confirmation, create the selected configuration file's parent
-   directory and config from the tracked root `config.example.json`; validate it
-   against root `config.schema.json`. Do **not** put a real path, credential, token,
-   or CLI authorization into any tracked file or the Skill installation directory.
-4. On a missing, invalid, revoked, or stale configuration return a bootstrap prompt
+3. After explicit confirmation, create the selected **v1.1** configuration file's
+   parent directory and config from the tracked root `config.example.json`; validate it
+   against root `config.schema.json`. Its closed `external_enrichment` policy defaults
+   to `automatic`. Do **not** put a real path, credential, token, or CLI authorization
+   into any tracked file or the Skill installation directory.
+4. A v1.0 configuration remains usable but is normalized to `offline`; the guard does
+   not rewrite it. If a person asks for external enrichment, first preview the full
+   v1.1 machine-local configuration update and get a separate fresh confirmation for
+   that update. Only then may an automatic `develop` use a host-provided capability.
+5. On a missing, invalid, revoked, or stale configuration return a bootstrap prompt
    or unsaved draft. Do not read, scan, resolve links in, or write a Vault.
 
 When moving machines or when the previously authorized path no longer exists, request
@@ -66,6 +71,9 @@ not delete or modify any Vault note.
 
 ## Product limits
 
-Mind Garden has no MCP, network client, credential store, embedding/vector recall,
-database/index, background job, runtime installation, or Git automation. The
-project workflow configuration disables automatic commits.
+Mind Garden has no MCP, direct network client, credential store, embedding/vector
+recall, database/index, background job, runtime installation, or Git automation. A
+validated v1.1 `automatic` policy may consume only the separately documented,
+host-provided structured search/download capability; the Skill does not implement or
+configure it. `offline` remains available for one instruction and is mandatory for
+v1.0 configuration. The project workflow configuration disables automatic commits.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from fixtures import VaultFixture, guard
+from tests.fixtures import VaultFixture, guard
 
 
 class ReviewTests(VaultFixture):

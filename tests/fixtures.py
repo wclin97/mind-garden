@@ -29,6 +29,13 @@ class VaultFixture(unittest.TestCase):
             "vault_path": str(self.vault),
             "allowed_subdirectory": "Mind Garden",
             "limits": {"max_files": 100, "max_bytes": 1024 * 1024, "max_matches": 100},
+            "external_enrichment": {
+                "mode": "automatic",
+                "max_search_results": 5,
+                "max_image_downloads": 3,
+                "max_image_bytes": 1024 * 1024,
+                "max_excerpt_chars": 500,
+            },
         }
         self.ctx = guard.validate_scope_config(self.data)
 

@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "mind-garden-local-config/1.0",
+  "$id": "mind-garden-local-config/1.1",
   "title": "Mind Garden machine-local scope configuration",
   "description": "An explicitly confirmed, machine-local authorization for one Obsidian Vault subdirectory. Runtime configuration is stored outside the Skill installation directory.",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schema_version", "vault_path", "allowed_subdirectory"],
-  "properties": {
-    "schema_version": {"const": "mind-garden-local-config/1.0"},
+  "oneOf": [
+    {"$ref": "#/$defs/legacy_v1_0"},
+    {"$ref": "#/$defs/current_v1_1"}
+  ],
+  "$defs": {
     "vault_path": {
       "type": "string",
       "minLength": 1,
@@ -27,10 +27,47 @@
         "max_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
         "max_matches": {"type": "integer", "minimum": 1, "maximum": 5000}
       }
+    },
+    "external_enrichment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "max_search_results", "max_image_downloads", "max_image_bytes", "max_excerpt_chars"],
+      "properties": {
+        "mode": {"enum": ["automatic", "offline"]},
+        "max_search_results": {"type": "integer", "minimum": 1, "maximum": 10},
+        "max_image_downloads": {"type": "integer", "minimum": 1, "maximum": 3},
+        "max_image_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608},
+        "max_excerpt_chars": {"type": "integer", "minimum": 1, "maximum": 1000}
+      }
+    },
+    "legacy_v1_0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "vault_path", "allowed_subdirectory"],
+      "properties": {
+        "schema_version": {"const": "mind-garden-local-config/1.0"},
+        "vault_path": {"$ref": "#/$defs/vault_path"},
+        "allowed_subdirectory": {"$ref": "#/$defs/allowed_subdirectory"},
+        "limits": {"$ref": "#/$defs/limits"}
+      }
+    },
+    "current_v1_1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "vault_path", "allowed_subdirectory", "external_enrichment"],
+      "properties": {
+        "schema_version": {"const": "mind-garden-local-config/1.1"},
+        "vault_path": {"$ref": "#/$defs/vault_path"},
+        "allowed_subdirectory": {"$ref": "#/$defs/allowed_subdirectory"},
+        "limits": {"$ref": "#/$defs/limits"},
+        "external_enrichment": {"$ref": "#/$defs/external_enrichment"}
+      }
     }
   },
   "x-mind-garden-runtime-validation": [
     "Configuration absence produces only a bootstrap prompt or unsaved draft; it never selects, scans, or reads a default Vault.",
+    "Version 1.0 remains readable and is normalized to offline enrichment. It is never rewritten or silently granted network authority.",
+    "Version 1.1 requires an explicit complete external_enrichment policy. Unknown fields are rejected; host/provider connection details and credentials are not configuration fields.",
     "The Python scope guard canonicalizes Vault and scope with realpath, requires the scope to be a strict Vault descendant, and revalidates each operation.",
     "Every target is scope-relative. Existing components use descriptor-relative lstat/fstat plus O_NOFOLLOW/O_DIRECTORY; creation additionally requires component-wide O_NOFOLLOW_ANY and fails closed when unavailable.",
     "move_expected is unsupported because POSIX rename cannot atomically require an expected source hash.",
