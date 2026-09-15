@@ -20,7 +20,11 @@ folder can be modified.
 Writes remain guarded and non-escaping: creates are exclusive, patches use an expected
 SHA-256, and successful writes are read back. The guard may initialize only a missing
 direct fixed artifact parent (`captures`, `developments`, `distillations`, or `review`)
-inside `allowed_subdirectory`. `move_expected` remains unsupported.
+inside `allowed_subdirectory`. `move_expected` remains unsupported. The sole rename
+exception is `rename_content_note_expected`: it is descriptor-relative under the
+configured scope and only renames a same-directory legacy content note in `captures`,
+`developments`, or `distillations` to a canonical readable filename under the
+single-namespace-owner threat model.
 
 ## Interaction policy
 
@@ -35,6 +39,15 @@ overwrite or patch of review Markdown or Base must show the target, relevant cur
 and proposed SHA-256 hashes, and the exact unified diff, then obtain fresh confirmation
 for that exact proposal before persistence. A changed hash or declined confirmation
 returns an unsaved proposal and never retries automatically.
+
+A legacy content-note migration is allowed only after an explicit user request plus a
+complete from/to/hash/content-diff preview and fresh confirmation. The preview must
+show the source and destination scope-relative paths, current expected SHA-256, and
+exact content diff. `rename_content_note_expected` keeps it in the same content-note
+directory and preserves the stable frontmatter ID; it is not generic move permission.
+If any guarded verification after the filesystem rename fails, report the partial
+migration and stop without automatic retry or rollback. Existing notes never
+automatically rename.
 
 Distillation remains conservative even when the source set is unambiguous: show the
 complete source list with Vault-relative paths and SHA-256 hashes, the scope-relative

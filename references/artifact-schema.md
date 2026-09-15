@@ -24,11 +24,22 @@ a technical/proper term. Never translate solely for that preference. Call
 frontmatter and at the filename end. For example:
 `Y-T-W-L 肩胛稳定练习--mg-20260914-044626.md`.
 
-Existing notes are never automatically renamed or moved, and legacy ID-only filenames
-remain readable and writable through existing APIs. Attachments retain content-hash
-filenames; fixed review Markdown/Base names do not change. On `ALREADY_EXISTS`, do not
-overwrite: use a new timestamp ID. A changed conservative distillation target requires
-a refreshed preview and confirmation.
+Existing notes are never automatically renamed or moved. A legacy ID-only content
+note may use `rename_content_note_expected` only following an explicit user request,
+a complete from/to/hash/content-diff preview, and fresh confirmation. That narrow
+migration keeps the note in the same direct `captures`, `developments`, or
+`distillations` directory, changes only a legacy filename to the exact
+`build_note_filename(title, note_id)` result, and preserves the stable frontmatter ID
+and all note bytes. Legacy ID-only filenames otherwise remain readable and writable
+through existing APIs. Attachments retain content-hash filenames; fixed review
+Markdown/Base names do not change. On `ALREADY_EXISTS`, do not overwrite: use a new
+timestamp ID. A changed conservative distillation target requires a refreshed preview
+and confirmation. A guarded partial migration stops without automatic retry or
+rollback. If the confirmed migration also patches a source note and changes its
+SHA-256, every derivative that records that source must update all three together:
+the Vault-relative `derived_from` path, the path-qualified wikilink target/display,
+and the recorded provenance SHA-256. A path-only link rewrite with a stale source
+hash is invalid.
 
 `<id>` is a stable `mg-` identifier. If one listed direct parent is missing, an
 exclusive create may create that fixed parent inside `allowed_subdirectory`. Reads
@@ -120,6 +131,13 @@ before the guarded write. A decline, hash conflict, or uncertain target leaves o
 unsaved artifact proposal. Creates use exclusive creation; existing-note patches use an
 expected source hash; every successful write is immediately guarded-read and checked.
 Every write target remains scope-relative to `allowed_subdirectory`.
+
+A legacy content-note migration is not an automatic rename. It needs an explicit user
+request, a complete from/to/hash/content-diff preview, and fresh confirmation before
+`rename_content_note_expected` may perform its same-directory guarded rename. The
+frontmatter stable ID remains unchanged. Any failure after the filesystem rename is a
+partial migration: report it and stop, with no automatic retry or rollback. Generic
+move remains unsupported.
 
 Distillation is deliberately conservative. Even after its sources are uniquely
 identified, show the complete source list with their Vault-relative paths and hashes,

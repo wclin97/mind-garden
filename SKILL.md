@@ -110,6 +110,17 @@ and proposed SHA-256 hashes, and the exact unified diff, then obtain fresh
 confirmation for that exact proposal before persistence. A changed hash, declined
 confirmation, or unresolved target leaves only an unsaved proposal.
 
+A legacy content-note migration is the sole rename exception. It is allowed only
+following an explicit user request and a complete preview containing the source and
+destination scope-relative paths, the current SHA-256, and the exact content diff,
+followed by fresh confirmation of that unchanged proposal. Then call only
+`rename_content_note_expected` with that expected hash. It can rename only a regular
+Markdown note within the same direct `captures`, `developments`, or `distillations`
+directory to a canonical readable filename; generic moves remain unsupported. The
+rename preserves the note bytes, including its stable frontmatter ID. If guarded
+read-back or source-absence verification reports a partial migration, stop and report
+it: never automatically retry or roll back.
+
 Distillation remains conservative even when guarded discovery uniquely identifies its
 sources: show the source list with Vault-relative paths and SHA-256 hashes, its target,
 and the exact new-file diff, then obtain fresh confirmation before persistence.
@@ -126,9 +137,11 @@ and the exact new-file diff, then obtain fresh confirmation before persistence.
 4. Apply the interaction policy above. A permitted direct create uses exactly one
    guarded `exclusive_create` or `exclusive_create_development_bundle` call; a
    confirmed existing-artifact update uses `patch_expected` or
-   `patch_expected_text`. The guard may create only a missing direct artifact parent
-   named `captures`, `developments`, `distillations`, or `review` inside
-   `allowed_subdirectory`.
+   `patch_expected_text`. The only rename is a separately explicitly requested,
+   fully previewed, freshly confirmed legacy content-note migration through
+   `rename_content_note_expected`; generic `move_expected` is not a fallback. The
+   guard may create only a missing direct artifact parent named `captures`,
+   `developments`, `distillations`, or `review` inside `allowed_subdirectory`.
 5. Immediately guarded-read every successful write and verify its expected
    hash/structure. `move_expected` remains unsupported.
 
@@ -147,11 +160,15 @@ ID at the filename end. For example:
 frontmatter. A generated capture title/H1 is metadata outside **Original expression**
 and must not rewrite or alter its literal content or digest.
 
-Never automatically rename or move existing notes. Legacy ID-only filenames remain
-readable and writable through existing APIs; attachments keep content-hash filenames;
-and fixed review Markdown/Base names remain unchanged. On `ALREADY_EXISTS`, do not
-overwrite: use a new timestamp ID. If that changes a conservative distillation target,
-refresh its preview and obtain a new confirmation.
+Never automatically rename or move existing notes. A legacy ID-only content note
+may be renamed only after the explicit-request, complete from/to/hash/content-diff
+preview, and fresh-confirmation migration sequence above; its stable frontmatter ID
+remains unchanged. Legacy ID-only filenames remain readable and writable through
+existing APIs when no explicitly confirmed migration is requested; attachments keep
+content-hash filenames; and fixed review Markdown/Base names remain unchanged. On
+`ALREADY_EXISTS`, do not overwrite: use a new timestamp ID. If that changes a
+conservative distillation target, refresh its preview and obtain a new confirmation.
+A partial guarded migration stops without automatic retry or rollback.
 
 ## Modes
 

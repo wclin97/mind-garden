@@ -263,6 +263,105 @@ class ScopeGuardTests(VaultFixture):
         self.assertEqual(guard.read_markdown(self.ctx, "captures/a.md").text, "move me\n")
         self.assertFalse((self.scope / "developments").exists())
 
+    def test_explicit_legacy_content_note_rename_reads_back_and_removes_source(self) -> None:
+        source_path = "captures/mg-20260914-044626.md"
+        source = guard.exclusive_create(self.ctx, source_path, "legacy content\n")
+        destination_path = "captures/Shoulder stability--mg-20260914-044626.md"
+
+        renamed = guard.rename_content_note_expected(
+            self.ctx, source_path, destination_path, source.sha256,
+        )
+
+        self.assertEqual(renamed.scope_relative_path, destination_path)
+        self.assertEqual(renamed.vault_relative_path, f"Mind Garden/{destination_path}")
+        self.assertEqual((renamed.text, renamed.sha256), (source.text, source.sha256))
+        self.assertEqual(guard.read_markdown(self.ctx, destination_path), renamed)
+        with self.assertRaises(guard.GuardFailure) as missing_source:
+            guard.resolve_target(self.ctx, source_path)
+        self.assertEqual(missing_source.exception.code, "NOT_FOUND")
+
+    def test_explicit_legacy_content_note_rename_conflict_and_stale_hash_preserve_source(self) -> None:
+        source_path = "developments/mg-20260914-044626.md"
+        destination_path = "developments/Stable title--mg-20260914-044626.md"
+        source = guard.exclusive_create(self.ctx, source_path, "legacy development\n")
+        destination = guard.exclusive_create(self.ctx, destination_path, "existing development\n")
+
+        with self.assertRaises(guard.GuardFailure) as conflict:
+            guard.rename_content_note_expected(self.ctx, source_path, destination_path, source.sha256)
+        self.assertEqual(conflict.exception.code, "ALREADY_EXISTS")
+        self.assertEqual(guard.read_markdown(self.ctx, source_path), source)
+        self.assertEqual(guard.read_markdown(self.ctx, destination_path), destination)
+
+        untouched_destination = "developments/Fresh title--mg-20260914-044627.md"
+        updated = guard.patch_expected(self.ctx, source_path, source.sha256, "updated legacy development\n")
+        for stale_hash in (source.sha256, "A" * 64, "0" * 63, True, 1):
+            with self.subTest(stale_hash=stale_hash), self.assertRaises(guard.GuardFailure) as stale:
+                guard.rename_content_note_expected(self.ctx, source_path, untouched_destination, stale_hash)
+            self.assertEqual(stale.exception.code, "HASH_CONFLICT")
+        self.assertEqual(guard.read_markdown(self.ctx, source_path), updated)
+        self.assertFalse((self.scope / untouched_destination).exists())
+
+    def test_explicit_legacy_content_note_rename_rejects_invalid_paths_names_and_non_markdown(self) -> None:
+        source_path = "captures/mg-20260914-044626.md"
+        source = guard.exclusive_create(self.ctx, source_path, "legacy capture\n")
+        canonical_destination = "captures/Readable title--mg-20260914-044626.md"
+        self.write_scope("captures/nested/mg-20260914-044626.md", "nested\n")
+        self.write_scope("review/mg-20260914-044626.md", "review\n")
+        self.write_scope("arbitrary/mg-20260914-044626.md", "arbitrary\n")
+        self.write_scope("captures/plain.txt", "not markdown\n")
+
+        cases = (
+            (source_path, "developments/Readable title--mg-20260914-044626.md", "PATH_INVALID"),
+            ("review/mg-20260914-044626.md", canonical_destination, "PATH_INVALID"),
+            ("arbitrary/mg-20260914-044626.md", canonical_destination, "PATH_INVALID"),
+            ("captures/nested/mg-20260914-044626.md", canonical_destination, "PATH_INVALID"),
+            (source_path, "captures/not-a-canonical-name.md", "PATH_INVALID"),
+            (source_path, "captures/  Spaced title--mg-20260914-044626.md", "PATH_INVALID"),
+            (source_path, "captures/Readable title--mg-not-an-id.md", "PATH_INVALID"),
+            ("captures/plain.txt", canonical_destination, "NOT_MARKDOWN"),
+            (source_path, "captures/Readable title--mg-20260914-044626.txt", "NOT_MARKDOWN"),
+        )
+        for from_path, to_path, code in cases:
+            with self.subTest(from_path=from_path, to_path=to_path), self.assertRaises(guard.GuardFailure) as caught:
+                guard.rename_content_note_expected(self.ctx, from_path, to_path, source.sha256)
+            self.assertEqual(caught.exception.code, code)
+
+        self.assertEqual(guard.read_markdown(self.ctx, source_path), source)
+        self.assertFalse((self.scope / canonical_destination).exists())
+
+    def test_explicit_legacy_content_note_rename_rejects_symlink_special_and_closes_descriptors(self) -> None:
+        destination_path = "captures/Readable title--mg-20260914-044626.md"
+        symlink_path = self.scope / "captures" / "mg-20260914-044626.md"
+        os.symlink(self.private_note, symlink_path)
+        with self.assertRaises(guard.GuardFailure) as symlink:
+            guard.rename_content_note_expected(self.ctx, "captures/mg-20260914-044626.md", destination_path, "0" * 64)
+        self.assertEqual(symlink.exception.code, "SYMLINK_REJECTED")
+        self.assertTrue(symlink_path.is_symlink())
+        symlink_path.unlink()
+
+        fifo_path = self.scope / "captures" / "mg-20260914-044626.md"
+        os.mkfifo(fifo_path)
+        with self.assertRaises(guard.GuardFailure) as special:
+            guard.rename_content_note_expected(self.ctx, "captures/mg-20260914-044626.md", destination_path, "0" * 64)
+        self.assertEqual(special.exception.code, "SPECIAL_FILE_REJECTED")
+        fifo_path.unlink()
+
+        if os.path.isdir("/dev/fd"):
+            source_path = "captures/mg-20260914-044627.md"
+            source = guard.exclusive_create(self.ctx, source_path, "descriptor fixture\n")
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(10):
+                with self.assertRaises(guard.GuardFailure) as stale:
+                    guard.rename_content_note_expected(
+                        self.ctx,
+                        source_path,
+                        "captures/Descriptor check--mg-20260914-044627.md",
+                        "0" * 64,
+                    )
+                self.assertEqual(stale.exception.code, "HASH_CONFLICT")
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
+            self.assertEqual(guard.read_markdown(self.ctx, source_path), source)
+
     def test_raster_attachment_plan_read_and_bundle_are_content_addressed(self) -> None:
         fixtures = {
             "image/png": b"\x89PNG\r\n\x1a\nfixture-png",

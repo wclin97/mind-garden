@@ -1553,6 +1553,10 @@ def _literal_fence(original: str) -> str:
 
 _NEW_CONTENT_NOTE_ID = re.compile(r"mg-\d{8}-\d{6}")
 _FILENAME_PROBLEM_CHARACTERS = re.compile(r"[\\\\/:*?\"'<>|\[\]#^]+")
+_CONTENT_NOTE_DIRECTORIES = frozenset({"captures", "developments", "distillations"})
+_CANONICAL_CONTENT_NOTE_FILENAME = re.compile(
+    r"(?P<title>.+)--(?P<note_id>mg-\d{8}-\d{6})\.md"
+)
 
 
 def build_note_filename(title: str, note_id: str) -> str:
@@ -1572,6 +1576,145 @@ def build_note_filename(title: str, note_id: str) -> str:
     if not readable_title:
         raise _failure("PATH_INVALID")
     return f"{readable_title}--{note_id}.md"
+
+
+def _validate_canonical_content_note_leaf(leaf: str) -> None:
+    """Accept only the exact readable filename form produced by the builder."""
+    match = _CANONICAL_CONTENT_NOTE_FILENAME.fullmatch(leaf)
+    if match is None:
+        raise _failure("PATH_INVALID")
+    title = match.group("title")
+    note_id = match.group("note_id")
+    try:
+        canonical = build_note_filename(title, note_id)
+    except GuardFailure:
+        raise _failure("PATH_INVALID") from None
+    if canonical != leaf:
+        raise _failure("PATH_INVALID")
+
+
+def _require_descriptor_rename_safe_io() -> None:
+    """Require the descriptor-relative rename primitive used by the narrow migration."""
+    _require_safe_io()
+    if os.rename not in getattr(os, "supports_dir_fd", set()):
+        raise _failure("UNSUPPORTED_SAFE_IO")
+
+
+def _raise_rename_open_failure(error: OSError) -> None:
+    """Translate source-open races without exposing host filesystem details."""
+    if error.errno == errno.ELOOP:
+        raise _failure("SYMLINK_REJECTED") from None
+    if error.errno == errno.ENOENT:
+        raise _failure("HASH_CONFLICT") from None
+    if error.errno in {errno.EISDIR, errno.ENOTDIR}:
+        raise _failure("SPECIAL_FILE_REJECTED") from None
+    raise _failure("PATH_ESCAPE") from None
+
+
+def _raise_rename_failure(error: OSError) -> None:
+    """Translate the narrow rename's remaining safe failure categories."""
+    if error.errno == errno.ELOOP:
+        raise _failure("SYMLINK_REJECTED") from None
+    if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise _failure("ALREADY_EXISTS") from None
+    if error.errno == errno.ENOENT:
+        # A source observed and hashed under this descriptor disappeared before
+        # the rename, so its optimistic precondition is no longer trustworthy.
+        raise _failure("HASH_CONFLICT") from None
+    if error.errno in {errno.EISDIR, errno.ENOTDIR}:
+        raise _failure("SPECIAL_FILE_REJECTED") from None
+    raise _failure("PATH_ESCAPE") from None
+
+
+def rename_content_note_expected(
+    ctx: ScopeContext,
+    source_scope_relative_path: str,
+    destination_scope_relative_path: str,
+    expected_sha256: str,
+) -> NoteRecord:
+    """Rename one explicitly confirmed legacy content note within its own namespace.
+
+    This is deliberately not a generic move.  It relies on the documented
+    single-namespace-owner threat model: after its final no-follow checks, no
+    concurrent namespace writer may create or replace either leaf.  The rename
+    remains descriptor-relative to one already-open direct scope child.
+    """
+    _require_markdown(source_scope_relative_path)
+    _require_markdown(destination_scope_relative_path)
+    source_parts = _validate_relative(source_scope_relative_path)
+    destination_parts = _validate_relative(destination_scope_relative_path)
+    if (
+        len(source_parts) != 2
+        or len(destination_parts) != 2
+        or source_parts[0] not in _CONTENT_NOTE_DIRECTORIES
+        or destination_parts[0] not in _CONTENT_NOTE_DIRECTORIES
+        or source_parts[0] != destination_parts[0]
+    ):
+        raise _failure("PATH_INVALID")
+    _validate_canonical_content_note_leaf(destination_parts[1])
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise _failure("HASH_CONFLICT")
+    _require_descriptor_rename_safe_io()
+
+    parent_fd, _, source_leaf = _target_parent(ctx, source_parts)
+    destination_leaf = destination_parts[1]
+    try:
+        source_st = _check_leaf(parent_fd, source_leaf, must_exist=True)
+        if _check_leaf(parent_fd, destination_leaf, must_exist=False, regular=False) is not None:
+            raise _failure("ALREADY_EXISTS")
+        try:
+            source_fd = os.open(
+                source_leaf,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            _raise_rename_open_failure(error)
+        try:
+            raw, opened_st = _read_fd_utf8(source_fd, int(ctx.limits["max_bytes"]))
+            if (
+                (source_st.st_dev, source_st.st_ino) != (opened_st.st_dev, opened_st.st_ino)
+                or sha256_bytes(raw) != expected_sha256
+            ):
+                raise _failure("HASH_CONFLICT")
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise _failure("INVALID_UTF8") from None
+
+            # Re-check both names immediately before the descriptor-relative
+            # rename.  POSIX lacks an expected-hash/no-replace primitive, hence
+            # the intentionally narrow single-namespace-owner contract above.
+            current_source_st = _check_leaf(parent_fd, source_leaf, must_exist=True)
+            if (current_source_st.st_dev, current_source_st.st_ino) != (opened_st.st_dev, opened_st.st_ino):
+                raise _failure("HASH_CONFLICT")
+            if _check_leaf(parent_fd, destination_leaf, must_exist=False, regular=False) is not None:
+                raise _failure("ALREADY_EXISTS")
+            try:
+                os.rename(
+                    source_leaf,
+                    destination_leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            except OSError as error:
+                _raise_rename_failure(error)
+        finally:
+            os.close(source_fd)
+    finally:
+        os.close(parent_fd)
+
+    renamed = read_markdown(ctx, destination_scope_relative_path)
+    if renamed.sha256 != expected_sha256:
+        raise _failure("HASH_CONFLICT")
+    try:
+        resolve_target(ctx, source_scope_relative_path)
+    except GuardFailure as error:
+        if error.code != "NOT_FOUND":
+            raise
+    else:
+        raise _failure("HASH_CONFLICT")
+    return renamed
 
 
 def _validate_capture_title(title: str) -> str:

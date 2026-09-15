@@ -114,6 +114,51 @@ class SkillContractTests(unittest.TestCase):
         guard_source = (SKILL_ROOT / "scripts" / "scope_guard.py").read_text(encoding="utf-8")
         self.assertIn("def build_note_filename(title: str, note_id: str)", guard_source)
 
+    def test_legacy_content_note_rename_contract_is_public_and_narrow(self) -> None:
+        guard_source = (SKILL_ROOT / "scripts" / "scope_guard.py").read_text(encoding="utf-8")
+        for fragment in (
+            "def rename_content_note_expected(",
+            "source_scope_relative_path: str",
+            "destination_scope_relative_path: str",
+            "expected_sha256: str",
+            "-> NoteRecord:",
+            "_CONTENT_NOTE_DIRECTORIES",
+            "len(source_parts) != 2",
+            "len(destination_parts) != 2",
+            "source_parts[0] != destination_parts[0]",
+            "_validate_canonical_content_note_leaf(destination_parts[1])",
+            "build_note_filename(title, note_id)",
+            "os.rename(",
+            "src_dir_fd=parent_fd",
+            "dst_dir_fd=parent_fd",
+            "renamed = read_markdown(ctx, destination_scope_relative_path)",
+            "resolve_target(ctx, source_scope_relative_path)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, guard_source)
+
+        policy = " ".join("\n".join((
+            self.skill,
+            self.references_by_name["authorization-and-scope.md"],
+            self.references_by_name["artifact-schema.md"],
+            self.references_by_name["mode-protocols.md"],
+        )).lower().split())
+        for phrase in (
+            "explicit user request",
+            "complete from/to/hash/content-diff preview",
+            "fresh confirmation",
+            "existing notes never automatically rename",
+            "stable frontmatter id",
+            "generic move remains unsupported",
+            "without automatic retry or rollback",
+            "the vault-relative `derived_from` path",
+            "the path-qualified wikilink target/display",
+            "the recorded provenance sha-256",
+            "a path-only link rewrite with a stale source hash is invalid",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, policy)
+
     def test_ambiguity_and_distillation_require_visible_confirmation(self) -> None:
         self.assertIn(
             "multiple plausible candidates or any other ambiguity must be shown to the user and require a question; never guess.",

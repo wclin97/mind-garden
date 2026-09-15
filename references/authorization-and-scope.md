@@ -39,6 +39,11 @@ Write-scope and compatibility APIs:
   write-scope path; it rejects a `None` path before a write API is called
 - `exclusive_create`, `patch_expected`, `exclusive_create_text`, and
   `patch_expected_text` accept only paths scope-relative to `allowed_subdirectory`
+- `rename_content_note_expected` is the only supported rename: it accepts only an
+  expected-hash guarded migration of a regular Markdown legacy content note within
+  one direct `captures`, `developments`, or `distillations` directory to a canonical
+  readable filename; it is descriptor-relative under `canonical_scope` and assumes a
+  single namespace owner during the final no-replace checks
 - `plan_raster_attachment`, `read_attachment`, and
   `exclusive_create_development_bundle` keep attachment paths scope-relative to
   `allowed_subdirectory`
@@ -83,6 +88,15 @@ overwrite or patch of review Markdown or Base must show the scope-relative targe
 relevant current and proposed SHA-256 hashes, and the exact unified diff, then obtain
 fresh confirmation before persistence. Existing-note edits retain expected SHA-256
 preconditions; successful writes are immediately guarded-read and verified.
+
+A legacy content-note rename is permitted only after an explicit user request plus a
+complete from/to/hash/content-diff preview and fresh confirmation. The preview names
+both scope-relative paths, presents the current expected SHA-256, and shows the exact
+unchanged content diff. `rename_content_note_expected` only performs a same-directory
+content-note migration under the configured write scope; generic move remains
+unsupported. It preserves the stable frontmatter ID. If the guarded destination
+read-back or source-absence check leaves a partial migration, stop without automatic
+retry or rollback.
 
 Distillation remains conservative: even when its sources were uniquely identified,
 show the source list with Vault-relative paths and hashes, the scope-relative target,
