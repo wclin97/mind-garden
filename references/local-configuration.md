@@ -1,79 +1,72 @@
-# Mind Garden local authorization
+# Mind Garden local configuration
 
-Mind Garden is a portable, single-root Skill. It does not discover a Vault, use the
-focused Vault, or infer a directory from the active note. Its only authorization is a
-machine-local configuration located outside the Skill installation.
+Mind Garden uses one machine-local configuration outside the Skill installation. It
+never guesses a Vault from the focused app or active note.
 
 ## Configuration discovery
 
 `scope_guard.load_config()` resolves exactly one config file in this order:
 
-1. `MIND_GARDEN_CONFIG`, when set, must name an **absolute file path**.
-2. `$XDG_CONFIG_HOME/mind-garden/config.json`, when `XDG_CONFIG_HOME` is set; the
-   XDG root must be absolute.
-3. `~/.config/mind-garden/config.json` when neither environment variable is set.
+1. absolute `MIND_GARDEN_CONFIG`;
+2. absolute `$XDG_CONFIG_HOME/mind-garden/config.json`;
+3. `~/.config/mind-garden/config.json`.
 
-A missing selected file is `CONFIG_MISSING`; a relative or otherwise illegal selected
-location, unreadable JSON, or invalid contract is `CONFIG_INVALID`. The guard never
-falls through from an explicit or XDG selection to a different location, and never
-chooses a Vault by default. It does not print configuration or Vault paths.
+A missing file is `CONFIG_MISSING`; an illegal location, unreadable JSON, or invalid
+contract is `CONFIG_INVALID`. The guard never falls through to a different location.
 
-## First use and migration
+## First use
 
-1. Ask the user for an absolute Vault root and one non-root directory inside it.
-2. Show the canonical Vault/scope and the limited operations this grants.
-3. After explicit confirmation, create the selected **v1.1** configuration file's
-   parent directory and config from the tracked root `config.example.json`; validate it
-   against root `config.schema.json`. Its closed `external_enrichment` policy defaults
-   to `automatic`. Do **not** put a real path, credential, token, or CLI authorization
-   into any tracked file or the Skill installation directory.
-4. A v1.0 configuration remains usable but is normalized to `offline`; the guard does
-   not rewrite it. If a person asks for external enrichment, first preview the full
-   v1.1 machine-local configuration update and get a separate fresh confirmation for
-   that update. Only then may an automatic `develop` use a host-provided capability.
-5. On a missing, invalid, revoked, or stale configuration return a bootstrap prompt
-   or unsaved draft. Do not read, scan, resolve links in, or write a Vault.
+Ask for:
 
-When moving machines or when the previously authorized path no longer exists, request
-a fresh authorization and create or update the selected user configuration; do not
-reuse or infer a replacement Vault path. The root schema and example remain tracked.
+1. the absolute Obsidian Vault root that Mind Garden may read;
+2. one non-root Vault-relative `allowed_subdirectory` that Mind Garden may write.
 
-## Boundary
+The tracked `config.example.json` and `config.schema.json` describe the v1.1 format.
+The real machine-local path is not committed. A v1.0 configuration remains valid and
+normalizes external enrichment to `offline`; v1.1 defaults to `automatic`.
 
-`scripts/scope_guard.py` is the sole product Vault-I/O boundary. It requires POSIX
-descriptor-relative no-follow semantics, canonicalizes the root and scope, rejects
-absolute/drive/UNC/`.`/`..`/symlink/special paths, and re-checks containment for
-every read, scan, create, patch, review, and Base operation. Creation additionally
-requires component-wide `O_NOFOLLOW_ANY`; there is no weaker fallback. During a guard
-operation, an uncooperative same-user process must not concurrently rename or replace
-the configured scope, its ancestors, any directory inside the authorized scope tree
-(including artifact parents), or the target leaf; public POSIX APIs cannot enforce
-that hostile namespace boundary. `move_expected` is disabled rather than pretending
-that POSIX rename can atomically compare a source hash. Errors use stable categories
-and never expose an outside path or its content.
+## Read/write boundary
 
-Retrieval is a bounded lexical scan of regular UTF-8 Markdown under the authorized
-scope only. Mind Garden never runs whole-Vault `obsidian search`, `backlinks`,
-`tags`, `tasks`, daily, `file=`, or default-target commands. A project-local vendor
-contract may be read for compatibility instructions, but it cannot bypass this
-boundary.
+`scripts/scope_guard.py` is the sole Vault filesystem boundary.
 
-## Persistence
+- `canonical_vault` is the read root for guarded Markdown discovery.
+- `canonical_scope`, derived from `allowed_subdirectory`, is the write root.
+- Whole-Vault read functions never open files with write flags. A whole-Vault-only
+  record outside `allowed_subdirectory` has `scope_relative_path: None` and no
+  writable scope path.
+- Create, patch, attachment, review-output, and Base-output APIs accept only paths
+  scope-relative to `allowed_subdirectory` and remain rooted at `canonical_scope`.
 
-Every persistent action shows its target and preview. Existing-file changes,
-reviews/Bases, and multi-source derivatives additionally show a unified diff and
-source SHA-256 values. A fresh explicit confirmation is required. Creates are
-exclusive; edits use expected source hashes and read-back verification. Moves fail
-closed as unsupported; uncertain writes are never retried automatically.
+Both roots are canonicalized and descriptor-walked without following symlinks.
+Absolute paths, drive/UNC forms, `.`, `..`, symlinks, special files, and containment
+escapes are rejected. Retrieval remains bounded by configured file, byte, and match
+limits.
 
-To revoke access, remove or invalidate the selected user configuration. This does
-not delete or modify any Vault note.
+## Interaction and persistence
 
-## Product limits
+Natural-language intent inference may use guarded whole-Vault reads. It may select a
+unique candidate; multiple plausible candidates or any ambiguity must be shown to the
+user and require a question. Never guess.
 
-Mind Garden has no MCP, direct network client, credential store, embedding/vector
-recall, database/index, background job, runtime installation, or Git automation. A
-validated v1.1 `automatic` policy may consume only the separately documented,
-host-provided structured search/download capability; the Skill does not implement or
-configure it. `offline` remains available for one instruction and is mandatory for
-v1.0 configuration. The project workflow configuration disables automatic commits.
+A clear request to create a new capture or new standalone development, including its
+validated attachment bundle, may write directly through the guard and read it back
+without an extra preview or confirmation round. The create target remains
+scope-relative to `allowed_subdirectory` and is exclusively created.
+
+An append or patch to an existing note, every connection operation, and any overwrite
+or patch of review Markdown or Base must show the target, relevant current and
+proposed SHA-256 hashes, and exact unified diff and obtain fresh confirmation before
+persistence. Patches require the expected source SHA-256 and successful writes are
+read back and verified.
+
+Distillation remains conservative: even after unique source discovery, show the source
+list with Vault-relative paths and hashes, the scope-relative target, and exact
+new-file diff, then obtain fresh confirmation before persistence. Mind Garden cannot
+modify any other Obsidian folder.
+
+## External enrichment
+
+A v1.1 `automatic` policy may consume the documented host-provided structured
+search/download capability. The Skill itself does not configure a provider. External
+payloads contain no Vault paths or note content, and accepted attachments are written
+only as scope-relative paths inside `allowed_subdirectory`.

@@ -22,9 +22,13 @@ fetch/no upstream Git metadata, and a SHA-256 match for every manifest file. Any
 only a draft/incompatibility; no global lookup, network fetch, install, or vendor
 rewrite is permitted.
 
-The local CLI contract is documentation, not authorization. Mind Garden does not
-call whole-Vault `obsidian search`, `backlinks`, `tags`, `tasks`, `daily:*`, `file=`
-or a target-less command. It uses the guarded local scanner and link parser. The
-local Markdown contract informs syntax but does not permit rewriting literal capture
-content. The Bases contract is loaded only for a user-selected optional Base and
-cannot make it authoritative or escape its fixed scope filters.
+The local CLI contract is documentation, not authorization. Direct Obsidian CLI
+retrieval is prohibited: never call `obsidian search`, `obsidian backlinks`, `obsidian tags`, `obsidian tasks`, `obsidian daily:*`, any `file=` form, or any
+target-less, default, or focused-Vault command. Whole-Vault reads are allowed only
+through the guarded Python scanner and link APIs. Those direct CLI forms bypass
+configured-root selection, scanner caps, no-follow and UTF-8 handling, and exact path
+provenance, and may default to the focused Vault or active file. The local Markdown
+contract informs syntax but does not permit rewriting literal capture content. The
+Bases contract applies only to optional Base output addressed by a scope-relative path
+under the configured `allowed_subdirectory`; it cannot make another Vault folder
+writable.

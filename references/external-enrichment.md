@@ -4,8 +4,9 @@
 
 Mind Garden is **not** a network client. It never imports or invokes HTTP tooling,
 provider SDKs, MCP, credentials, endpoint configuration, shells, installers, or a
-background process. During an explicitly requested `develop` mode only, an already
-available fixture-compatible host may expose these structured operations:
+background process. During a `develop` request that is explicitly stated or
+unambiguously inferred, an already available fixture-compatible host may expose these
+structured operations:
 
 ```text
 search({ query: <locally derived query>, max_results: <integer> })
@@ -43,14 +44,23 @@ Bytes remain in memory and only matching PNG/JPEG/WebP declared MIME plus magic 
 be planned. SVG, HTML, MIME mismatch, oversized, empty, or non-raster bytes are
 rejected locally as `partial` without retry. The host never chooses a Vault target.
 
-## Confirmed persistence
+## Guarded persistence
 
 A valid plan is content-addressed only as
 `attachments/<lowercase-sha256>.png|.jpg|.webp`. Its rendered form is the exact active
-embed `![[<scope>/attachments/<sha256>.<ext>]]`; external names, URLs, aliases, anchors,
-or size syntax are invalid. `exclusive_create_development_bundle` validates every
-active embed and plan before mutation, writes attachments first, creates the
-development last, then guarded-reads it. It never deletes to emulate rollback.
+embed `![[<configured allowed_subdirectory>/attachments/<sha256>.<ext>]]`; the
+placeholder denotes the actual user-configured folder, not a literal directory name.
+External names, URLs, aliases, anchors, or size syntax are invalid. All attachment and
+development write paths are scope-relative to `allowed_subdirectory`.
+
+`exclusive_create_development_bundle` validates every active embed and plan before
+mutation, writes attachments first, creates the development last, and reads them back.
+A clear request for a **new standalone development** may create this validated bundle
+through the guard and read it back without an extra preview or confirmation round. The
+exception applies only to that new development: a patch to an existing development
+must show its target, relevant current and proposed SHA-256 hashes, and exact unified
+diff and obtain fresh confirmation before persistence. It never deletes to emulate
+rollback.
 
 A partial bundle records `orphaned_attachments` only for guarded-read verified reusable
 attachments. It records `potential_orphaned_attachments` only as a validated planned

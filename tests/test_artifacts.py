@@ -81,6 +81,85 @@ class ArtifactTests(VaultFixture):
         self.assertEqual(guard.resolve_wikilink(self.ctx, one, "Mind Garden/captures/b", notes).state, "resolved")
         self.assertEqual([note.scope_relative_path for note in guard.backlinks(self.ctx, "captures/b.md", notes)], ["captures/a.md"])
 
+    def test_whole_vault_links_backlinks_and_outside_source_provenance(self) -> None:
+        self.private_note.write_text("# Outside\nshared marker\n", encoding="utf-8")
+        (self.private / "literals.md").write_text(
+            "# Literal examples\nshared marker\n`[[Private/secret]]`\n"
+            "```text\n[[Private/secret]]\n```\n",
+            encoding="utf-8",
+        )
+        self.write_scope(
+            "captures/linker.md",
+            "# Linker\nshared marker\n[[Private/secret|outside]]\n",
+        )
+        notes = guard.scan_vault_markdown(self.ctx, "shared marker")
+        outside = next(note for note in notes if note.vault_relative_path == "Private/secret.md")
+        literal = next(note for note in notes if note.vault_relative_path == "Private/literals.md")
+        linker = next(note for note in notes if note.vault_relative_path == "Mind Garden/captures/linker.md")
+
+        self.assertEqual(literal.links, ())
+        self.assertEqual(guard.resolve_vault_wikilink(self.ctx, linker, "secret", notes).state, "unresolved")
+        resolved = guard.resolve_vault_wikilink(self.ctx, linker, "Private/secret", notes)
+        self.assertEqual(resolved.state, "resolved")
+        self.assertEqual(resolved.target_vault_relative_path, "Private/secret.md")
+        self.assertIsNone(resolved.target_scope_relative_path)
+        self.assertEqual(
+            [note.vault_relative_path for note in guard.backlinks_vault(self.ctx, "Private/secret.md", notes)],
+            ["Mind Garden/captures/linker.md"],
+        )
+
+        derived = guard.render_derivative(
+            "development", "mg-outside-source", "Outside source", "Read-only source.",
+            [outside], "2026-09-13T00:00:00Z",
+        )
+        self.assertIn("[[Private/secret|Private/secret.md]]", derived)
+        self.assertIn(outside.sha256, derived)
+        preview = guard.make_preview("developments/from-outside.md", derived, sources=[outside])
+        self.assertEqual(preview.sources, (("Private/secret.md", outside.sha256),))
+
+        request = guard.build_external_search_request("outside source context", self.ctx.external_enrichment)
+        no_results = guard.render_derivative(
+            "development", "mg-outside-empty", "Outside no results", "Local development.",
+            [outside], "2026-09-13T00:00:00Z",
+            {"status": "no-results", "derived_query": "outside source context", "sources": [], "attachments": []},
+            self.ctx.external_enrichment,
+            search_request=request,
+        )
+        self.assertIn("Status: `no-results`", no_results)
+
+        plan = guard.plan_raster_attachment(b"\x89PNG\r\n\x1a\noutside", "image/png", 1024)
+        enrichment = {
+            "status": "used",
+            "derived_query": "outside source context",
+            "sources": [{
+                "source_url": "https://example.test/outside",
+                "title": "Outside evidence",
+                "snippet": "Bounded evidence.",
+                "license": "unknown",
+                "retrieved_at": "2026-09-13T00:00:00Z",
+            }],
+            "attachments": [{
+                "target": plan.target_scope_relative_path,
+                "sha256": plan.sha256,
+                "media_type": plan.media_type,
+                "bytes": plan.byte_count,
+                "source_url": "https://example.test/outside.png",
+                "license": "unknown",
+                "retrieved_at": "2026-09-13T00:00:00Z",
+            }],
+        }
+        enriched = guard.render_derivative(
+            "development", "mg-outside-enriched", "Outside enriched", "Local development.",
+            [outside], "2026-09-13T00:00:00Z", enrichment, self.ctx.external_enrichment,
+            search_request=request,
+            write_scope_vault_relative_posix=self.ctx.scope_vault_relative_posix,
+        )
+        self.assertIn(f"![[Mind Garden/{plan.target_scope_relative_path}]]", enriched)
+        bundle = guard.exclusive_create_development_bundle(
+            self.ctx, "developments/mg-outside-enriched.md", enriched, [plan],
+        )
+        self.assertEqual(bundle.status, "complete")
+
     def test_preview_carries_diff_hashes_and_sources(self) -> None:
         source = guard.exclusive_create(self.ctx, "captures/a.md", "source\n")
         preview = guard.make_preview("developments/x.md", "after\n", "before\n", [source])

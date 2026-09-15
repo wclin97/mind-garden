@@ -64,7 +64,36 @@ class VendorContractTests(unittest.TestCase):
                 guard.verify_vendor(str(root))
         self.assertEqual(caught.exception.code, "VENDOR_INVALID")
 
-    def test_vendor_tree_is_read_only_baseline(self) -> None:
+    def test_vendor_contract_prohibits_bypass_cli_routes(self) -> None:
+        contract = (SKILL_ROOT / "references/vendor-contract.md").read_text(encoding="utf-8")
+        normalized_contract = " ".join(contract.split())
+        self.assertIn("Direct Obsidian CLI retrieval is prohibited", normalized_contract)
+        self.assertIn("Whole-Vault reads are allowed only through the guarded Python scanner and link APIs", normalized_contract)
+        prohibited_route = (
+            "never call `obsidian search`, `obsidian backlinks`, `obsidian tags`, "
+            "`obsidian tasks`, `obsidian daily:*`, any `file=` form"
+        )
+        self.assertIn(prohibited_route, normalized_contract)
+        for command in (
+            "obsidian search",
+            "obsidian backlinks",
+            "obsidian tags",
+            "obsidian tasks",
+            "obsidian daily:*",
+            "file=",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(f"`{command}`", normalized_contract)
+        for rationale in (
+            "configured-root selection",
+            "scanner caps",
+            "no-follow and UTF-8 handling",
+            "exact path provenance",
+            "focused Vault or active file",
+        ):
+            with self.subTest(rationale=rationale):
+                self.assertIn(rationale, normalized_contract)
+
         manifest = SKILL_ROOT / "vendor/kepano-obsidian-skills/MANIFEST.json"
         self.assertTrue(manifest.is_file())
         self.assertEqual(guard.verify_vendor(str(SKILL_ROOT))["verified_files"], 7)

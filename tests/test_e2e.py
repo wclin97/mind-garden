@@ -58,7 +58,12 @@ class EndToEndFixtureTests(VaultFixture):
         # connect: only the managed region changes under an expected hash.
         link = guard.build_wikilink("Mind Garden/captures/mg-two", "second thought")
         proposed = guard.patch_managed_connections(first.text, [link])
-        connected = guard.patch_expected(self.ctx, first.scope_relative_path, first.sha256, proposed)
+        connected = guard.patch_expected(
+            self.ctx,
+            guard.scope_path_for_write(self.ctx, first),
+            first.sha256,
+            proposed,
+        )
         self.assertEqual(guard.original_expression_digest(connected.text), guard.original_expression_digest(first.text))
 
         # develop and distill: same-topic context can stay in one note; separate
@@ -69,7 +74,12 @@ class EndToEndFixtureTests(VaultFixture):
             "Keep this discussion with the original thought.",
             "2026-09-13T00:30:00Z",
         )
-        merged = guard.patch_expected(self.ctx, connected.scope_relative_path, connected.sha256, merged_text)
+        merged = guard.patch_expected(
+            self.ctx,
+            guard.scope_path_for_write(self.ctx, connected),
+            connected.sha256,
+            merged_text,
+        )
         self.assertIn("more context for the same idea", merged.text)
         development = guard.render_derivative("development", "mg-dev", "Develop", "Explore both fragments.", [merged, second], "2026-09-13T01:00:00Z")
         developed = guard.exclusive_create(self.ctx, "developments/mg-dev.md", development)
@@ -78,7 +88,10 @@ class EndToEndFixtureTests(VaultFixture):
         related = guard.build_wikilink("Mind Garden/developments/mg-dev", "development")
         proposed_distillation = guard.patch_managed_connections(distilled.text, [related])
         connected_distillation = guard.patch_expected(
-            self.ctx, distilled.scope_relative_path, distilled.sha256, proposed_distillation
+            self.ctx,
+            guard.scope_path_for_write(self.ctx, distilled),
+            distilled.sha256,
+            proposed_distillation,
         )
         self.assertIn("Mind Garden/developments/mg-dev", connected_distillation.text)
 

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "mind-garden-local-config/1.1",
-  "title": "Mind Garden machine-local scope configuration",
-  "description": "An explicitly confirmed, machine-local authorization for one Obsidian Vault subdirectory. Runtime configuration is stored outside the Skill installation directory.",
+  "title": "Mind Garden machine-local read/write boundary configuration",
+  "description": "Selects one Obsidian Vault for guarded Markdown reads and one Vault-relative subdirectory as the exclusive write boundary. Runtime configuration is stored outside the Skill installation directory.",
   "oneOf": [
     {"$ref": "#/$defs/legacy_v1_0"},
     {"$ref": "#/$defs/current_v1_1"}
@@ -11,13 +11,13 @@
     "vault_path": {
       "type": "string",
       "minLength": 1,
-      "description": "Absolute user-confirmed Vault root. Runtime realpath/no-follow validation is authoritative."
+      "description": "Absolute configured Vault root and guarded read boundary. Runtime realpath/no-follow validation is authoritative."
     },
     "allowed_subdirectory": {
       "type": "string",
       "minLength": 1,
       "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!\\.?$)[^\\\\]+$",
-      "description": "One non-root, POSIX-style Vault-relative scope; it cannot be empty, ., .., absolute, drive, UNC, or contain a backslash."
+      "description": "The only Vault-relative folder Mind Garden may create or modify. All write API targets are scope-relative to this configured allowed_subdirectory and may use only its fixed artifact subdirectories. It cannot be empty, ., .., absolute, drive, UNC, or contain a backslash."
     },
     "limits": {
       "type": "object",
@@ -68,10 +68,10 @@
     "Configuration absence produces only a bootstrap prompt or unsaved draft; it never selects, scans, or reads a default Vault.",
     "Version 1.0 remains readable and is normalized to offline enrichment. It is never rewritten or silently granted network authority.",
     "Version 1.1 requires an explicit complete external_enrichment policy. Unknown fields are rejected; host/provider connection details and credentials are not configuration fields.",
-    "The Python scope guard canonicalizes Vault and scope with realpath, requires the scope to be a strict Vault descendant, and revalidates each operation.",
-    "Every target is scope-relative. Existing components use descriptor-relative lstat/fstat plus O_NOFOLLOW/O_DIRECTORY; creation additionally requires component-wide O_NOFOLLOW_ANY and fails closed when unavailable.",
+    "The Python guard canonicalizes the Vault read root and the strict descendant write scope, then revalidates each operation.",
+    "Read targets are Vault-relative and every write target is scope-relative to allowed_subdirectory. Both use descriptor-relative lstat/fstat plus O_NOFOLLOW/O_DIRECTORY; creation additionally requires component-wide O_NOFOLLOW_ANY.",
     "move_expected is unsupported because POSIX rename cannot atomically require an expected source hash.",
     "An uncooperative same-user process must not concurrently rename or replace the configured scope, its ancestors, any in-scope directory including artifact parents, or a target leaf during a guard operation; public POSIX APIs cannot enforce that hostile namespace model.",
-    "Scope-external, symlinked, special, absolute, drive, UNC, ., and .. paths are rejected without exposing the external path or content."
+    "Paths outside the configured Vault are unreadable; all writes remain scope-relative to allowed_subdirectory, and paths outside it are never writable. Symlinked, special, absolute, drive, UNC, ., and .. write targets are rejected."
   ]
 }

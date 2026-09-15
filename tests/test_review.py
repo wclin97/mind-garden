@@ -9,7 +9,7 @@ class ReviewTests(VaultFixture):
     def test_empty_review_has_safe_markdown_fallback(self) -> None:
         rendered = guard.render_review_snapshot([], "2026-09-13T00:00:00Z")
         self.assertIn("Non-authoritative", rendered)
-        self.assertIn("No open in-scope captures", rendered)
+        self.assertIn("No open captures found", rendered)
 
     def test_review_uses_only_explicit_open_capture_metadata(self) -> None:
         open_capture = guard.exclusive_create(self.ctx, "captures/open.md", guard.render_capture("mg-open", "keep", "2026-09-13T00:00:00Z"))
@@ -20,7 +20,32 @@ class ReviewTests(VaultFixture):
         self.assertNotIn("closed", rendered)
         self.assertNotIn("malformed", rendered)
 
-    def test_base_is_scope_filtered_and_yaml_safe_for_folder_characters(self) -> None:
+    def test_review_lists_open_captures_across_vault_but_writes_only_in_scope(self) -> None:
+        inside = guard.exclusive_create(
+            self.ctx,
+            "captures/inside.md",
+            guard.render_capture("mg-inside", "inside", "2026-09-13T00:00:00Z"),
+        )
+        outside_path = self.private / "outside.md"
+        outside_path.write_text(
+            guard.render_capture("mg-outside", "outside", "2026-09-13T00:00:00Z"),
+            encoding="utf-8",
+        )
+
+        records = guard.scan_vault_markdown(self.ctx, "mind-garden-capture")
+        rendered = guard.render_review_snapshot(records, "2026-09-13T01:00:00Z")
+        self.assertIn("[[Mind Garden/captures/inside|captures/inside.md]]", rendered)
+        self.assertIn("[[Private/outside|Private/outside.md]]", rendered)
+        self.assertIn(inside.sha256, rendered)
+        review = guard.exclusive_create(self.ctx, "review/Vault Review.md", rendered)
+        self.assertEqual(review.scope_relative_path, "review/Vault Review.md")
+        self.assertTrue((self.scope / "review/Vault Review.md").is_file())
+
+        with self.assertRaises(guard.GuardFailure) as outside_write:
+            guard.exclusive_create(self.ctx, "Private/Vault Review.md", rendered)
+        self.assertEqual(outside_write.exception.code, "PATH_INVALID")
+        self.assertFalse((self.private / "Vault Review.md").exists())
+
         rendered = guard.render_review_base("Mind Garden/Ideas: special")
         self.assertIn("file.inFolder(\"Mind Garden/Ideas: special\")", rendered)
         self.assertIn('file.ext == "md"', rendered)

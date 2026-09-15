@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence, overload
 
 CONFIG_VERSION = "mind-garden-local-config/1.1"
 LEGACY_CONFIG_VERSION = "mind-garden-local-config/1.0"
@@ -48,6 +48,8 @@ DEFAULT_EXTERNAL_ENRICHMENT = {
 }
 # The configured 1..10 preference is additionally constrained at the host boundary.
 HOST_SEARCH_RESULT_CAP = 5
+# Bounds total directory and non-Markdown traversal during any guarded scan.
+MAX_SCAN_ENTRIES = 100_000
 LEGACY_EXTERNAL_ENRICHMENT = {**DEFAULT_EXTERNAL_ENRICHMENT, "mode": "offline"}
 TEXT_ARTIFACT_DIRECTORIES = frozenset({"captures", "developments", "distillations", "review"})
 # Kept as a compatibility alias: attachment bytes never use this text-artifact set.
@@ -199,7 +201,7 @@ class ExternalEnrichment:
 @dataclasses.dataclass(frozen=True)
 class NoteRecord:
     vault_relative_path: str
-    scope_relative_path: str
+    scope_relative_path: str | None
     sha256: str
     text: str
     frontmatter: Mapping[str, str]
@@ -220,6 +222,7 @@ class LinkResolution:
     state: str
     target_scope_relative_path: str | None = None
     anchor: str | None = None
+    target_vault_relative_path: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -374,11 +377,13 @@ def _validate_context(ctx: ScopeContext) -> None:
         os.close(vault_fd)
 
 
-def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str]:
-    """Open all existing parent directories using descriptor-relative no-follow."""
+def _walk_existing_parent_from_root(ctx: ScopeContext, parts: Sequence[str], root: str) -> tuple[int, str]:
+    """Open existing parents below the selected canonical read or write root."""
     _validate_context(ctx)
-    fd = _open_directory(ctx.canonical_scope)
-    absolute = ctx.canonical_scope
+    if root not in {ctx.canonical_vault, ctx.canonical_scope}:
+        raise _failure("PATH_ESCAPE")
+    fd = _open_directory(root)
+    absolute = root
     try:
         for part in parts:
             try:
@@ -403,12 +408,17 @@ def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int,
             os.close(fd)
             fd = new_fd
             absolute = os.path.join(absolute, part)
-        if os.path.realpath(absolute) != absolute or not (absolute == ctx.canonical_scope or _is_descendant(absolute, ctx.canonical_scope)):
+        if os.path.realpath(absolute) != absolute or not (absolute == root or _is_descendant(absolute, root)):
             raise _failure("PATH_ESCAPE")
         return fd, absolute
     except Exception:
         os.close(fd)
         raise
+
+
+def _walk_existing_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str]:
+    """Backward-compatible write-scope parent walk."""
+    return _walk_existing_parent_from_root(ctx, parts, ctx.canonical_scope)
 
 
 def _require_create_safe_io() -> None:
@@ -497,12 +507,26 @@ def _exclusive_create_payload(ctx: ScopeContext, parts: Sequence[str], payload: 
         os.close(fd)
 
 
-def _target_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str, str]:
+def _target_parent_from_root(ctx: ScopeContext, parts: Sequence[str], root: str) -> tuple[int, str, str]:
     if len(parts) == 1:
-        fd = _open_directory(ctx.canonical_scope)
-        return fd, ctx.canonical_scope, parts[0]
-    fd, parent = _walk_existing_parent(ctx, parts[:-1])
+        fd = _open_directory(root)
+        return fd, root, parts[0]
+    fd, parent = _walk_existing_parent_from_root(ctx, parts[:-1], root)
     return fd, parent, parts[-1]
+
+
+def _target_parent(ctx: ScopeContext, parts: Sequence[str]) -> tuple[int, str, str]:
+    return _target_parent_from_root(ctx, parts, ctx.canonical_scope)
+
+
+@overload
+def _check_leaf(parent_fd: int, leaf: str, *, must_exist: Literal[True], regular: bool = True) -> os.stat_result:
+    ...
+
+
+@overload
+def _check_leaf(parent_fd: int, leaf: str, *, must_exist: bool, regular: bool = True) -> os.stat_result | None:
+    ...
 
 
 def _check_leaf(parent_fd: int, leaf: str, *, must_exist: bool, regular: bool = True) -> os.stat_result | None:
@@ -563,7 +587,7 @@ def _canonical_scope_from_data(data: Mapping[str, Any], allow_create_scope: bool
     policy = _validate_external_policy(data.get("external_enrichment"), legacy=legacy)
     vault_path = data.get("vault_path")
     scope_name = data.get("allowed_subdirectory")
-    if not isinstance(vault_path, str) or not os.path.isabs(vault_path):
+    if not isinstance(vault_path, str) or not os.path.isabs(vault_path) or not isinstance(scope_name, str):
         raise _failure("CONFIG_INVALID")
     try:
         scope_parts = _validate_relative(scope_name)
@@ -575,8 +599,8 @@ def _canonical_scope_from_data(data: Mapping[str, Any], allow_create_scope: bool
     if not os.path.isdir(vault) or os.path.islink(vault):
         raise _failure("CONFIG_INVALID")
     vault_fd = _open_directory(vault)
+    current_fd = vault_fd
     try:
-        current_fd = vault_fd
         current_path = vault
         for index, part in enumerate(scope_parts):
             try:
@@ -689,6 +713,21 @@ def resolve_target(ctx: ScopeContext, scope_relative_path: str, purpose: str = "
         os.close(parent_fd)
 
 
+def resolve_vault_target(ctx: ScopeContext, vault_relative_path: str) -> str:
+    """Resolve an existing regular UTF-8-eligible Markdown file for read-only use."""
+    _require_markdown(vault_relative_path)
+    parts = _validate_relative(vault_relative_path)
+    parent_fd, parent, leaf = _target_parent_from_root(ctx, parts, ctx.canonical_vault)
+    try:
+        _check_leaf(parent_fd, leaf, must_exist=True)
+        result = os.path.join(parent, leaf)
+        if os.path.realpath(parent) != parent or not _is_descendant(result, ctx.canonical_vault):
+            raise _failure("PATH_ESCAPE")
+        return result
+    finally:
+        os.close(parent_fd)
+
+
 def _parse_frontmatter(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     if not text.startswith("---\n"):
@@ -704,8 +743,34 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return result
 
 
+def _markdown_without_literal_code(text: str) -> str:
+    """Remove fenced and inline code before interpreting active wikilinks."""
+    active: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        marker_line = stripped.rstrip("\r\n")
+        if fence_character is not None:
+            if re.fullmatch(re.escape(fence_character) + "{" + str(fence_length) + ",}\\s*", marker_line):
+                fence_character = None
+                fence_length = 0
+            active.append("\n" if line.endswith("\n") else "")
+            continue
+        opening = re.match(r"(`{3,}|~{3,})", stripped)
+        if opening is not None:
+            marker = opening.group(1)
+            fence_character = marker[0]
+            fence_length = len(marker)
+            active.append("\n" if line.endswith("\n") else "")
+            continue
+        active.append(re.sub(r"(`+)([^`\n]*?)\1", "", line))
+    return "".join(active)
+
+
 def extract_wikilinks(text: str) -> tuple[str, ...]:
-    return tuple(match.group(1) for match in re.finditer(r"(?<!!)\[\[([^\]]+)\]\]", text))
+    active_text = _markdown_without_literal_code(text)
+    return tuple(match.group(1) for match in re.finditer(r"(?<!!)\[\[([^\]]+)\]\]", active_text))
 
 
 def _read_fd_utf8(fd: int, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
@@ -727,10 +792,17 @@ def _read_fd_utf8(fd: int, max_bytes: int | None = None) -> tuple[bytes, os.stat
     return b"".join(chunks), after
 
 
-def read_markdown(ctx: ScopeContext, scope_relative_path: str) -> NoteRecord:
-    _require_markdown(scope_relative_path)
-    parts = _validate_relative(scope_relative_path)
-    parent_fd, _, leaf = _target_parent(ctx, parts)
+def _read_markdown_from_root(
+    ctx: ScopeContext,
+    relative_path: str,
+    root: str,
+    scope_relative_path: str | None,
+    *,
+    max_bytes: int | None = None,
+) -> NoteRecord:
+    _require_markdown(relative_path)
+    parts = _validate_relative(relative_path)
+    parent_fd, parent, leaf = _target_parent_from_root(ctx, parts, root)
     try:
         expected = _check_leaf(parent_fd, leaf, must_exist=True)
         try:
@@ -738,27 +810,52 @@ def read_markdown(ctx: ScopeContext, scope_relative_path: str) -> NoteRecord:
         except OSError:
             raise _failure("SYMLINK_REJECTED") from None
         try:
-            raw, opened = _read_fd_utf8(fd, int(ctx.limits["max_bytes"]))
+            raw, opened = _read_fd_utf8(
+                fd,
+                min(int(ctx.limits["max_bytes"]), max_bytes)
+                if max_bytes is not None
+                else int(ctx.limits["max_bytes"]),
+            )
         finally:
             os.close(fd)
         if (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino):
             raise _failure("HASH_CONFLICT")
+        path = os.path.join(parent, leaf)
+        if os.path.realpath(parent) != parent or not _is_descendant(path, root):
+            raise _failure("PATH_ESCAPE")
     finally:
         os.close(parent_fd)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise _failure("INVALID_UTF8") from None
-    path = resolve_target(ctx, scope_relative_path)
     return NoteRecord(
         _relative_posix(path, ctx.canonical_vault), scope_relative_path,
         sha256_bytes(raw), text, _parse_frontmatter(text), extract_wikilinks(text),
     )
 
 
+def read_markdown(ctx: ScopeContext, scope_relative_path: str) -> NoteRecord:
+    """Read Markdown relative to the configured write scope."""
+    return _read_markdown_from_root(
+        ctx, scope_relative_path, ctx.canonical_scope, scope_relative_path,
+    )
+
+
+def read_vault_markdown(ctx: ScopeContext, vault_relative_path: str) -> NoteRecord:
+    """Read Markdown anywhere inside the configured Vault without granting write access."""
+    parts = _validate_relative(vault_relative_path)
+    normalized = "/".join(parts)
+    prefix = ctx.scope_vault_relative_posix + "/"
+    scope_relative = normalized[len(prefix):] if normalized.startswith(prefix) else None
+    return _read_markdown_from_root(
+        ctx, normalized, ctx.canonical_vault, scope_relative,
+    )
+
+
 def read_guarded_text(ctx: ScopeContext, scope_relative_path: str, allowed_suffixes: Sequence[str] = (".md", ".base")) -> GuardedTextRecord:
     """Read a guarded UTF-8 text artifact without making it eligible for scanning."""
-    if not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
+    if not isinstance(scope_relative_path, str) or not any(scope_relative_path.endswith(suffix) for suffix in allowed_suffixes):
         raise _failure("NOT_MARKDOWN")
     parts = _validate_relative(scope_relative_path)
     parent_fd, _, leaf = _target_parent(ctx, parts)
@@ -1085,7 +1182,7 @@ def exclusive_create_development_bundle(
         development = exclusive_create(ctx, development_path, development_text)
         # A complete result means every participant is freshly guarded-read.
         verified_attachments = tuple(read_attachment(ctx, item.target_scope_relative_path) for item in records)
-        verified_development = read_markdown(ctx, development.scope_relative_path)
+        verified_development = read_markdown(ctx, development_path)
     except GuardFailure as error:
         return _partial_bundle_result(ctx, planned, attempt_ledger, records, error.code, development)
     return DevelopmentBundleResult("complete", verified_development, verified_attachments, (), None)
@@ -1111,7 +1208,7 @@ def exclusive_create_text(ctx: ScopeContext, scope_relative_path: str, utf8_text
 
 def patch_expected_text(ctx: ScopeContext, scope_relative_path: str, expected_sha256: str, replacement_text: str) -> GuardedTextRecord:
     """Safely replace a Markdown or Base text artifact after a SHA-256 precondition."""
-    if not any(scope_relative_path.endswith(suffix) for suffix in (".md", ".base")):
+    if not isinstance(scope_relative_path, str) or not any(scope_relative_path.endswith(suffix) for suffix in (".md", ".base")):
         raise _failure("NOT_MARKDOWN")
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
         raise _failure("HASH_CONFLICT")
@@ -1143,8 +1240,21 @@ def patch_expected_text(ctx: ScopeContext, scope_relative_path: str, expected_sh
 
 
 def _scanned_record(ctx: ScopeContext, path: str, scope_relative: str, max_bytes: int) -> NoteRecord:
-    # Resolve via the same descriptor/no-follow target boundary before content read.
-    return read_markdown(ctx, scope_relative)
+    # Resolve via the same descriptor/no-follow write-scope boundary before content read.
+    return _read_markdown_from_root(
+        ctx, scope_relative, ctx.canonical_scope, scope_relative, max_bytes=max_bytes,
+    )
+
+
+def _scanned_vault_record(ctx: ScopeContext, path: str, vault_relative: str, max_bytes: int) -> NoteRecord:
+    # Whole-Vault discovery is read-only and never returns a writable path for outside records.
+    parts = _validate_relative(vault_relative)
+    normalized = "/".join(parts)
+    prefix = ctx.scope_vault_relative_posix + "/"
+    scope_relative = normalized[len(prefix):] if normalized.startswith(prefix) else None
+    return _read_markdown_from_root(
+        ctx, normalized, ctx.canonical_vault, scope_relative, max_bytes=max_bytes,
+    )
 
 
 def _effective_scan_limit(name: str, requested: int | None, configured: int) -> int:
@@ -1155,9 +1265,18 @@ def _effective_scan_limit(name: str, requested: int | None, configured: int) -> 
     return min(requested, configured)
 
 
-def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, max_bytes: int | None = None, max_matches: int | None = None) -> list[NoteRecord]:
-    """Bounded lexical scan of regular UTF-8 Markdown below the selected scope only."""
+def _scan_markdown_from_root(
+    ctx: ScopeContext,
+    query: str,
+    root: str,
+    reader: Any,
+    max_files: int | None,
+    max_bytes: int | None,
+    max_matches: int | None,
+) -> list[NoteRecord]:
     _validate_context(ctx)
+    if root not in {ctx.canonical_vault, ctx.canonical_scope}:
+        raise _failure("PATH_ESCAPE")
     if not isinstance(query, str) or not query:
         raise _failure("PATH_INVALID")
     file_cap = _effective_scan_limit("max_files", max_files, int(ctx.limits["max_files"]))
@@ -1165,14 +1284,22 @@ def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, m
     match_cap = _effective_scan_limit("max_matches", max_matches, int(ctx.limits["max_matches"]))
     matches: list[NoteRecord] = []
     files_seen = 0
+    entries_seen = 0
     bytes_seen = 0
-    stack: list[tuple[str, str]] = [(ctx.canonical_scope, "")]
+    stack: list[tuple[str, str]] = [(root, "")]
     needle = query.casefold()
     while stack:
         directory, relative_prefix = stack.pop()
         directory_fd = _open_directory(directory)
         try:
-            entries = sorted(list(os.scandir(directory_fd)), key=lambda entry: entry.name)
+            entries: list[os.DirEntry[str]] = []
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    entries_seen += 1
+                    if entries_seen > MAX_SCAN_ENTRIES:
+                        raise _failure("SCAN_LIMIT")
+                    entries.append(entry)
+            entries.sort(key=lambda entry: entry.name)
             for entry in entries:
                 name = entry.name
                 rel = f"{relative_prefix}/{name}" if relative_prefix else name
@@ -1193,14 +1320,30 @@ def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, m
                 bytes_seen += st.st_size
                 if bytes_seen > byte_cap:
                     raise _failure("SCAN_LIMIT")
-                record = _scanned_record(ctx, os.path.join(directory, name), rel, byte_cap)
+                record = reader(ctx, os.path.join(directory, name), rel, byte_cap)
                 if needle in record.text.casefold():
                     matches.append(record)
                     if len(matches) > match_cap:
                         raise _failure("SCAN_LIMIT")
         finally:
             os.close(directory_fd)
-    return sorted(matches, key=lambda record: record.scope_relative_path)
+    return sorted(matches, key=lambda record: record.vault_relative_path)
+
+
+def scan_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, max_bytes: int | None = None, max_matches: int | None = None) -> list[NoteRecord]:
+    """Backward-compatible bounded scan below the configured write scope."""
+    return _scan_markdown_from_root(
+        ctx, query, ctx.canonical_scope, _scanned_record,
+        max_files, max_bytes, max_matches,
+    )
+
+
+def scan_vault_markdown(ctx: ScopeContext, query: str, max_files: int | None = None, max_bytes: int | None = None, max_matches: int | None = None) -> list[NoteRecord]:
+    """Bounded read-only lexical scan across the configured Vault."""
+    return _scan_markdown_from_root(
+        ctx, query, ctx.canonical_vault, _scanned_vault_record,
+        max_files, max_bytes, max_matches,
+    )
 
 
 def _split_wikilink(raw: str) -> tuple[str, str | None]:
@@ -1230,7 +1373,7 @@ def _anchor_exists(text: str, anchor: str) -> bool:
 
 
 def resolve_wikilink(ctx: ScopeContext, source_note: NoteRecord | str, raw_link: str, known_notes: Iterable[NoteRecord]) -> LinkResolution:
-    """Resolve only fully-qualified in-scope, already scanned Markdown links."""
+    """Resolve a fully-qualified link only when its target is inside the write scope."""
     try:
         target, anchor = _split_wikilink(raw_link)
     except GuardFailure:
@@ -1245,7 +1388,31 @@ def resolve_wikilink(ctx: ScopeContext, source_note: NoteRecord | str, raw_link:
     candidate = candidates[0]
     if anchor and not _anchor_exists(candidate.text, anchor):
         return LinkResolution(raw_link, "unresolved")
-    return LinkResolution(raw_link, "resolved", candidate.scope_relative_path, anchor)
+    return LinkResolution(
+        raw_link, "resolved", candidate.scope_relative_path, anchor,
+        candidate.vault_relative_path,
+    )
+
+
+def resolve_vault_wikilink(ctx: ScopeContext, source_note: NoteRecord | str, raw_link: str, known_notes: Iterable[NoteRecord]) -> LinkResolution:
+    """Resolve a path-qualified wikilink anywhere inside the configured Vault."""
+    try:
+        target, anchor = _split_wikilink(raw_link)
+    except GuardFailure:
+        return LinkResolution(raw_link, "unresolved")
+    if "/" not in target:
+        return LinkResolution(raw_link, "unresolved")
+    wanted = target + ".md"
+    candidates = [note for note in known_notes if note.vault_relative_path == wanted]
+    if len(candidates) != 1:
+        return LinkResolution(raw_link, "ambiguous" if len(candidates) > 1 else "unresolved")
+    candidate = candidates[0]
+    if anchor and not _anchor_exists(candidate.text, anchor):
+        return LinkResolution(raw_link, "unresolved")
+    return LinkResolution(
+        raw_link, "resolved", candidate.scope_relative_path, anchor,
+        candidate.vault_relative_path,
+    )
 
 
 def backlinks(ctx: ScopeContext, target_scope_relative_path: str, known_notes: Iterable[NoteRecord]) -> list[NoteRecord]:
@@ -1259,7 +1426,27 @@ def backlinks(ctx: ScopeContext, target_scope_relative_path: str, known_notes: I
             if resolved.state == "resolved" and resolved.target_scope_relative_path == target_scope_relative_path:
                 result.append(note)
                 break
-    return sorted(result, key=lambda note: note.scope_relative_path)
+    return sorted(result, key=lambda note: note.vault_relative_path)
+
+
+def backlinks_vault(ctx: ScopeContext, target_vault_relative_path: str, known_notes: Iterable[NoteRecord]) -> list[NoteRecord]:
+    """Return guarded whole-Vault backlinks to one Vault-relative Markdown target."""
+    normalized = "/".join(_validate_relative(target_vault_relative_path))
+    target = next((note for note in known_notes if note.vault_relative_path == normalized), None)
+    if target is None:
+        raise _failure("NOT_FOUND")
+    result: list[NoteRecord] = []
+    for note in known_notes:
+        for raw in note.links:
+            resolved = resolve_vault_wikilink(ctx, note, raw, known_notes)
+            if resolved.state == "resolved" and resolved.target_vault_relative_path == target.vault_relative_path:
+                result.append(note)
+                break
+    return sorted(result, key=lambda note: note.vault_relative_path)
+
+
+def _note_display_path(note: NoteRecord) -> str:
+    return note.scope_relative_path or note.vault_relative_path
 
 
 def make_preview(target_scope_relative_path: str, proposed_text: str, before_text: str | None = None, sources: Iterable[NoteRecord] = ()) -> Preview:
@@ -1271,8 +1458,23 @@ def make_preview(target_scope_relative_path: str, proposed_text: str, before_tex
     return Preview(
         target_scope_relative_path, sha256_text(before_text) if before_text is not None else None,
         sha256_text(proposed_text), diff,
-        tuple((source.scope_relative_path, source.sha256) for source in sources), proposed_text,
+        tuple((_note_display_path(source), source.sha256) for source in sources), proposed_text,
     )
+
+
+def scope_path_for_write(ctx: ScopeContext, record: NoteRecord) -> str:
+    """Narrow an existing guarded record to its verified write-scope path.
+
+    Whole-Vault records outside ``allowed_subdirectory`` deliberately carry no
+    scope-relative path. Callers that turn an existing record into a patch target
+    must use this helper before a write API, rather than forwarding ``None``.
+    """
+    if not isinstance(record, NoteRecord) or not isinstance(record.scope_relative_path, str):
+        raise _failure("PATH_INVALID")
+    current = read_markdown(ctx, record.scope_relative_path)
+    if current.vault_relative_path != record.vault_relative_path:
+        raise _failure("PATH_INVALID")
+    return record.scope_relative_path
 
 
 def exclusive_create(ctx: ScopeContext, scope_relative_path: str, utf8_text: str) -> NoteRecord:
@@ -1651,7 +1853,7 @@ def _render_legacy_derivative(
     _utf8_payload(body)
     _utf8_payload(created_at)
     links = "\n".join(
-        f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} (sha256: `{note.sha256}`)"
+        f"- {build_wikilink(note.vault_relative_path[:-3], _note_display_path(note))} (sha256: `{note.sha256}`)"
         for note in sources
     )
     return (
@@ -1675,6 +1877,7 @@ def render_derivative(
     external_policy: ExternalEnrichmentPolicy | None = None,
     *,
     search_request: ExternalSearchRequest | None = None,
+    write_scope_vault_relative_posix: str | None = None,
 ) -> str:
     if external_enrichment is None:
         if search_request is not None:
@@ -1688,10 +1891,16 @@ def render_derivative(
         external_enrichment, policy=external_policy, search_request=search_request,
     )
     links = "\n".join(
-        f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} (sha256: `{note.sha256}`)"
+        f"- {build_wikilink(note.vault_relative_path[:-3], _note_display_path(note))} (sha256: `{note.sha256}`)"
         for note in sources
     )
-    external_section = "\n\n" + _render_external_enrichment(enrichment, _external_scope_prefix(sources))
+    if write_scope_vault_relative_posix is None:
+        if enrichment.attachments and any(source.scope_relative_path is None for source in sources):
+            raise _failure("PATH_INVALID")
+        scope_prefix = _external_scope_prefix(sources) if enrichment.attachments else ""
+    else:
+        scope_prefix = "/".join(_validate_relative(write_scope_vault_relative_posix))
+    external_section = "\n\n" + _render_external_enrichment(enrichment, scope_prefix)
     return (
         f"---\nkind: mind-garden-{kind}\nid: {note_id}\ncreated_at: {created_at}\n"
         f"derived_from:\n{''.join(f'  - {note.vault_relative_path}\n' for note in sources)}---\n\n"
@@ -1774,9 +1983,9 @@ def render_review_snapshot(records: Sequence[NoteRecord], generated_at: str) -> 
     open_captures = [note for note in records if note.frontmatter.get("kind") == "mind-garden-capture" and note.frontmatter.get("status") == "open"]
     lines = ["# Mind Garden Review", "", "> Non-authoritative Markdown snapshot. Regenerate after reviewing captures.", "", f"Generated: {generated_at}", ""]
     if not open_captures:
-        return "\n".join(lines + ["No open in-scope captures.", ""])
-    for note in sorted(open_captures, key=lambda item: item.scope_relative_path):
-        lines.append(f"- {build_wikilink(note.vault_relative_path[:-3], note.scope_relative_path)} — `{note.sha256}`")
+        return "\n".join(lines + ["No open captures found.", ""])
+    for note in sorted(open_captures, key=lambda item: item.vault_relative_path):
+        lines.append(f"- {build_wikilink(note.vault_relative_path[:-3], _note_display_path(note))} — `{note.sha256}`")
     return "\n".join(lines) + "\n"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.fixtures import VaultFixture, guard
@@ -22,6 +23,136 @@ class ScopeGuardTests(VaultFixture):
             with self.subTest(kwargs=kwargs), self.assertRaises(guard.GuardFailure) as invalid:
                 guard.scan_markdown(self.ctx, "inside", **kwargs)
             self.assertEqual(invalid.exception.code, "SCAN_LIMIT")
+
+    def test_whole_vault_reads_siblings_but_writes_remain_in_configured_scope(self) -> None:
+        outside = guard.read_vault_markdown(self.ctx, "Private/secret.md")
+        self.assertEqual(outside.vault_relative_path, "Private/secret.md")
+        self.assertIsNone(outside.scope_relative_path)
+        self.assertIn("outside-only confidential query", outside.text)
+
+        matches = guard.scan_vault_markdown(self.ctx, "confidential query")
+        self.assertEqual([record.vault_relative_path for record in matches], ["Private/secret.md"])
+        self.assertIsNone(matches[0].scope_relative_path)
+
+        inside = guard.exclusive_create(self.ctx, "captures/write-target.md", "inside\n")
+        self.assertEqual(guard.scope_path_for_write(self.ctx, inside), "captures/write-target.md")
+        original = self.private_note.read_text(encoding="utf-8")
+        with mock.patch.object(guard, "patch_expected", wraps=guard.patch_expected) as patch:
+            with self.assertRaises(guard.GuardFailure) as write_target:
+                guard.scope_path_for_write(self.ctx, outside)
+        self.assertEqual(write_target.exception.code, "PATH_INVALID")
+        patch.assert_not_called()
+
+        with self.assertRaises(guard.GuardFailure) as create_outside:
+            guard.exclusive_create(self.ctx, "Private/new.md", "blocked\n")
+        self.assertEqual(create_outside.exception.code, "PATH_INVALID")
+        with self.assertRaises(guard.GuardFailure) as patch_outside:
+            guard.patch_expected(self.ctx, "../Private/secret.md", outside.sha256, "blocked\n")
+        self.assertEqual(patch_outside.exception.code, "PATH_INVALID")
+        self.assertEqual(self.private_note.read_text(encoding="utf-8"), original)
+        self.assertFalse((self.private / "new.md").exists())
+
+    def test_custom_allowed_subdirectory_writes_fixed_artifacts_only_there(self) -> None:
+        custom_name = "Idea Shelf"
+        custom_scope = self.vault / custom_name
+        custom_scope.mkdir()
+        custom_data = {**self.data, "allowed_subdirectory": custom_name}
+        custom_ctx = guard.validate_scope_config(custom_data)
+
+        for relative in (
+            "captures/custom.md",
+            "developments/custom.md",
+            "distillations/custom.md",
+            "review/custom.md",
+        ):
+            with self.subTest(relative=relative):
+                created = guard.exclusive_create(custom_ctx, relative, "custom scope\n")
+                self.assertEqual(created.scope_relative_path, relative)
+                self.assertEqual(created.vault_relative_path, f"{custom_name}/{relative}")
+                self.assertTrue((custom_scope / relative).is_file())
+                self.assertFalse((self.scope / relative).exists())
+
+        with self.assertRaises(guard.GuardFailure) as old_scope:
+            guard.exclusive_create(custom_ctx, "Mind Garden/captures/not-allowed.md", "blocked\n")
+        self.assertEqual(old_scope.exception.code, "PATH_INVALID")
+        with self.assertRaises(guard.GuardFailure) as sibling:
+            guard.exclusive_create(custom_ctx, "../Private/not-allowed.md", "blocked\n")
+        self.assertEqual(sibling.exception.code, "PATH_INVALID")
+        self.assertFalse((self.private / "not-allowed.md").exists())
+
+    def test_resolve_vault_target_accepts_only_regular_markdown_files(self) -> None:
+        self.assertEqual(
+            guard.resolve_vault_target(self.ctx, "Private/secret.md"),
+            os.path.realpath(self.private_note),
+        )
+        (self.private / "directory.md").mkdir()
+        os.symlink(self.private_note, self.private / "symlink.md")
+        os.mkfifo(self.private / "pipe.md")
+        (self.private / "plain.txt").write_text("not markdown", encoding="utf-8")
+
+        for relative, code in (
+            ("Private/directory.md", "SPECIAL_FILE_REJECTED"),
+            ("Private/symlink.md", "SYMLINK_REJECTED"),
+            ("Private/pipe.md", "SPECIAL_FILE_REJECTED"),
+            ("Private/plain.txt", "NOT_MARKDOWN"),
+        ):
+            with self.subTest(relative=relative), self.assertRaises(guard.GuardFailure) as caught:
+                guard.resolve_vault_target(self.ctx, relative)
+            self.assertEqual(caught.exception.code, code)
+
+    def test_scan_vault_markdown_is_bounded_and_cannot_escape_the_vault(self) -> None:
+        self.write_scope("captures/in-scope.md", "vault scan marker\n")
+        (self.private / "matching.md").write_text("vault scan marker\n", encoding="utf-8")
+        outside = Path(self.tempdir) / "outside"
+        outside.mkdir()
+        (outside / "escaped.md").write_text("vault scan marker\n", encoding="utf-8")
+        os.symlink(outside, self.private / "escaped-directory")
+        os.symlink(self.private / "matching.md", self.private / "matching-link.md")
+
+        records = guard.scan_vault_markdown(self.ctx, "vault scan marker")
+        self.assertEqual(
+            [record.vault_relative_path for record in records],
+            ["Mind Garden/captures/in-scope.md", "Private/matching.md"],
+        )
+        self.assertEqual(records[0].scope_relative_path, "captures/in-scope.md")
+        self.assertIsNone(records[1].scope_relative_path)
+        with self.assertRaises(guard.GuardFailure) as linked_read:
+            guard.read_vault_markdown(self.ctx, "Private/matching-link.md")
+        self.assertEqual(linked_read.exception.code, "SYMLINK_REJECTED")
+        with self.assertRaises(guard.GuardFailure) as escaped_read:
+            guard.resolve_vault_target(self.ctx, "Private/escaped-directory/escaped.md")
+        self.assertEqual(escaped_read.exception.code, "SYMLINK_REJECTED")
+
+        for kwargs in (
+            {"max_files": 1},
+            {"max_bytes": 1},
+            {"max_matches": 1},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(guard.GuardFailure) as bounded:
+                guard.scan_vault_markdown(self.ctx, "vault scan marker", **kwargs)
+            self.assertEqual(bounded.exception.code, "SCAN_LIMIT")
+
+        entry_vault = Path(self.tempdir) / "Entry Cap Vault"
+        entry_scope = entry_vault / "a-write-scope"
+        entry_load = entry_vault / "z-entry-load"
+        entry_scope.mkdir(parents=True)
+        entry_load.mkdir()
+        entry_ctx = guard.validate_scope_config({
+            **self.data,
+            "vault_path": str(entry_vault),
+            "allowed_subdirectory": "a-write-scope",
+        })
+        for index in range(6):
+            (entry_load / f"non-markdown-{index}.txt").write_text("ignored", encoding="utf-8")
+        with mock.patch.object(guard, "MAX_SCAN_ENTRIES", 5):
+            with self.assertRaises(guard.GuardFailure) as entry_limit:
+                guard.scan_vault_markdown(entry_ctx, "no match")
+        self.assertEqual(entry_limit.exception.code, "SCAN_LIMIT")
+
+        (self.private / "invalid.md").write_bytes(b"\xff")
+        with self.assertRaises(guard.GuardFailure) as invalid_utf8:
+            guard.scan_vault_markdown(self.ctx, "vault scan marker")
+        self.assertEqual(invalid_utf8.exception.code, "INVALID_UTF8")
 
     def test_rejects_absolute_dot_dotdot_drive_unc_and_empty_paths(self) -> None:
         for target in ("", ".", "..", "captures/../secret.md", "/tmp/out.md", "C:/out.md", "\\\\server\\share\\out.md", "captures\\out.md"):
