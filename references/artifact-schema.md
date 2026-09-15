@@ -9,11 +9,26 @@ Source notes used for discovery, connections, development, distillation, or revi
 live anywhere inside the configured Vault. A whole-Vault-only source is represented by
 its Vault-relative path and has no writable `scope_relative_path`.
 
-- `captures/<id>.md`
-- `developments/<id>.md`
-- `distillations/<id>.md`
+- `captures/<readable-title>--<id>.md`
+- `developments/<readable-title>--<id>.md`
+- `distillations/<readable-title>--<id>.md`
 - `review/Mind Garden Review.md` and (opt-in) `review/Mind Garden Review.base`
 - `attachments/<lowercase-sha256>.png|.jpg|.webp` (raster-only, not Markdown)
+
+For **new content notes only**, choose a concise human-readable title: prefer
+Chinese when it naturally and accurately describes the idea, but use English or a
+natural mixed Chinese/English title when Chinese would be awkward, vague, or distort
+a technical/proper term. Never translate solely for that preference. Call
+`build_note_filename(title, note_id)` to produce
+`<readable-title>--mg-YYYYMMDD-HHMMSS.md`; the timestamp-bearing stable ID stays in
+frontmatter and at the filename end. For example:
+`Y-T-W-L 肩胛稳定练习--mg-20260914-044626.md`.
+
+Existing notes are never automatically renamed or moved, and legacy ID-only filenames
+remain readable and writable through existing APIs. Attachments retain content-hash
+filenames; fixed review Markdown/Base names do not change. On `ALREADY_EXISTS`, do not
+overwrite: use a new timestamp ID. A changed conservative distillation target requires
+a refreshed preview and confirmation.
 
 `<id>` is a stable `mg-` identifier. If one listed direct parent is missing, an
 exclusive create may create that fixed parent inside `allowed_subdirectory`. Reads

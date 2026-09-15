@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Literal, Mapping, Sequence, overload
 
@@ -1550,13 +1551,48 @@ def _literal_fence(original: str) -> str:
     return "`" * max(3, longest + 1)
 
 
-def render_capture(note_id: str, original: str, created_at: str) -> str:
+_NEW_CONTENT_NOTE_ID = re.compile(r"mg-\d{8}-\d{6}")
+_FILENAME_PROBLEM_CHARACTERS = re.compile(r"[\\\\/:*?\"'<>|\[\]#^]+")
+
+
+def build_note_filename(title: str, note_id: str) -> str:
+    """Build a portable, readable filename for a newly created content note."""
+    if not isinstance(note_id, str) or _NEW_CONTENT_NOTE_ID.fullmatch(note_id) is None:
+        raise _failure("PATH_INVALID")
+    _utf8_payload(title)
+    if any(unicodedata.category(char) == "Cc" and not char.isspace() for char in title):
+        raise _failure("PATH_INVALID")
+    readable_title = " ".join(title.split())
+    if not readable_title:
+        raise _failure("PATH_INVALID")
+    readable_title = _FILENAME_PROBLEM_CHARACTERS.sub("-", readable_title)
+    readable_title = re.sub(r"\s*-\s*", "-", readable_title)
+    readable_title = re.sub(r"-{2,}", "-", readable_title)
+    readable_title = readable_title[:80].rstrip(" .-")
+    if not readable_title:
+        raise _failure("PATH_INVALID")
+    return f"{readable_title}--{note_id}.md"
+
+
+def _validate_capture_title(title: str) -> str:
+    _utf8_payload(title)
+    if (
+        not title.strip()
+        or any(unicodedata.category(char) == "Cc" for char in title)
+        or any(char in "\u2028\u2029" for char in title)
+    ):
+        raise _failure("PATH_INVALID")
+    return title
+
+
+def render_capture(note_id: str, original: str, created_at: str, title: str | None = None) -> str:
     if not re.fullmatch(r"mg-[a-z0-9-]+", note_id):
         raise _failure("PATH_INVALID")
+    heading = "# Capture " + note_id if title is None else "# " + _validate_capture_title(title)
     fence = _literal_fence(original)
     return (
         "---\nkind: mind-garden-capture\nid: " + note_id + "\nstatus: open\ncreated_at: " + created_at + "\n---\n\n"
-        "# Capture " + note_id + "\n\n"
+        + heading + "\n\n"
         "## Original expression (literal; do not rewrite)\n\n" + fence + "\n" + original + "\n" + fence + "\n\n"
         "<!-- mind-garden:development:start -->\n<!-- mind-garden:development:end -->\n\n"
         "<!-- mind-garden:connections:start -->\n<!-- mind-garden:connections:end -->\n"

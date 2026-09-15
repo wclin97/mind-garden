@@ -78,6 +78,42 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("exact unified diff", policy)
         self.assertIn("fresh confirmation", policy)
 
+    def test_new_content_note_filename_policy_is_exact_and_backward_compatible(self) -> None:
+        naming = " ".join(self.skill.split())
+        schema = self.references_by_name["artifact-schema.md"]
+        for phrase in (
+            "only to new content notes",
+            "Choose a concise, human-readable title.",
+            "Prefer Chinese when it accurately and naturally describes the idea",
+            "use English or a natural mixed Chinese/English title",
+            "Never translate merely to satisfy the Chinese preference.",
+            "build_note_filename(title, note_id)",
+            "<readable-title>--mg-YYYYMMDD-HHMMSS.md",
+            "Y-T-W-L 肩胛稳定练习--mg-20260914-044626.md",
+            "at the filename end",
+            "The stable ID also remains in frontmatter.",
+            "generated capture title/H1 is metadata outside **Original expression**",
+            "must not rewrite or alter its literal content or digest.",
+            "Never automatically rename or move existing notes.",
+            "Legacy ID-only filenames remain readable and writable through existing APIs",
+            "attachments keep content-hash filenames",
+            "fixed review Markdown/Base names remain unchanged.",
+            "On `ALREADY_EXISTS`, do not overwrite: use a new timestamp ID.",
+            "refresh its preview and obtain a new confirmation.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, naming)
+        for path in (
+            "captures/<readable-title>--<id>.md",
+            "developments/<readable-title>--<id>.md",
+            "distillations/<readable-title>--<id>.md",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, naming)
+                self.assertIn(path, schema)
+        guard_source = (SKILL_ROOT / "scripts" / "scope_guard.py").read_text(encoding="utf-8")
+        self.assertIn("def build_note_filename(title: str, note_id: str)", guard_source)
+
     def test_ambiguity_and_distillation_require_visible_confirmation(self) -> None:
         self.assertIn(
             "multiple plausible candidates or any other ambiguity must be shown to the user and require a question; never guess.",

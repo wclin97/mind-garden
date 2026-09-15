@@ -7,6 +7,85 @@ from tests.fixtures import VaultFixture, guard
 
 
 class ArtifactTests(VaultFixture):
+    def test_build_note_filename_preserves_unicode_and_sanitizes_portably(self) -> None:
+        note_id = "mg-20260914-044626"
+        self.assertEqual(
+            guard.build_note_filename("Y-T-W-L 肩胛稳定练习", note_id),
+            "Y-T-W-L 肩胛稳定练习--mg-20260914-044626.md",
+        )
+        self.assertEqual(
+            guard.build_note_filename("An accurate English title", note_id),
+            "An accurate English title--mg-20260914-044626.md",
+        )
+        self.assertEqual(
+            guard.build_note_filename("Plan:/\\*?\"'<>|[]#^next", note_id),
+            "Plan-next--mg-20260914-044626.md",
+        )
+        self.assertEqual(
+            guard.build_note_filename("  Spaced\t title...---  ", note_id),
+            "Spaced title--mg-20260914-044626.md",
+        )
+
+    def test_build_note_filename_rejects_invalid_ids_and_titles_and_caps_title(self) -> None:
+        note_id = "mg-20260914-044626"
+        for invalid_id in ("mg-20260914-04462", "mg-20260914-044626-extra", "mg-idea-1"):
+            with self.subTest(invalid_id=invalid_id), self.assertRaises(guard.GuardFailure):
+                guard.build_note_filename("Valid title", invalid_id)
+        for invalid_title in ("", " \t\n", "\x00"):
+            with self.subTest(invalid_title=invalid_title), self.assertRaises(guard.GuardFailure):
+                guard.build_note_filename(invalid_title, note_id)
+        self.assertEqual(
+            guard.build_note_filename("名" * 81, note_id),
+            "名" * 80 + "--mg-20260914-044626.md",
+        )
+
+    def test_helper_filename_is_accepted_for_new_development_and_distillation_targets(self) -> None:
+        note_id = "mg-20260914-044626"
+        source = guard.exclusive_create(
+            self.ctx,
+            "captures/source.md",
+            guard.render_capture("mg-source", "raw", "2026-09-13T00:00:00Z"),
+        )
+        development_path = "developments/" + guard.build_note_filename("Shoulder stability", note_id)
+        development = guard.render_derivative(
+            "development", note_id, "Shoulder stability", "Expanded practice.", [source], "2026-09-14T04:46:26Z",
+        )
+        bundle = guard.exclusive_create_development_bundle(self.ctx, development_path, development, [])
+        self.assertEqual(bundle.status, "complete")
+        self.assertEqual(bundle.development.scope_relative_path if bundle.development else None, development_path)
+
+        distillation_path = "distillations/" + guard.build_note_filename("练习要点", note_id)
+        distillation = guard.render_derivative(
+            "distillation", note_id, "练习要点", "Concise synthesis.", [source], "2026-09-14T04:46:26Z",
+        )
+        created = guard.exclusive_create(self.ctx, distillation_path, distillation)
+        self.assertEqual(created.scope_relative_path, distillation_path)
+
+    def test_titled_capture_preserves_literal_original_and_legacy_bytes(self) -> None:
+        note_id = "mg-idea-1"
+        original = "\n  想法 😀 [[not a link]]\n````\ntrailing  \n"
+        created_at = "2026-09-13T00:00:00Z"
+        expected_legacy = (
+            "---\nkind: mind-garden-capture\nid: mg-idea-1\nstatus: open\n"
+            "created_at: 2026-09-13T00:00:00Z\n---\n\n# Capture mg-idea-1\n\n"
+            "## Original expression (literal; do not rewrite)\n\n`````\n"
+            "\n  想法 😀 [[not a link]]\n````\ntrailing  \n\n`````\n\n"
+            "<!-- mind-garden:development:start -->\n<!-- mind-garden:development:end -->\n\n"
+            "<!-- mind-garden:connections:start -->\n<!-- mind-garden:connections:end -->\n"
+        )
+        legacy = guard.render_capture(note_id, original, created_at)
+        titled = guard.render_capture(note_id, original, created_at, title="Shoulder stability practice")
+        self.assertEqual(legacy, expected_legacy)
+        self.assertIn("# Shoulder stability practice\n", titled)
+        self.assertEqual(guard.original_expression_digest(titled), guard.original_expression_digest(legacy))
+        self.assertEqual(
+            titled[titled.index("## Original expression"):],
+            legacy[legacy.index("## Original expression"):],
+        )
+        for invalid_title in ("", "line\nbreak", "contains\x00control", "\ud800"):
+            with self.subTest(invalid_title=invalid_title), self.assertRaises(guard.GuardFailure):
+                guard.render_capture(note_id, original, created_at, title=invalid_title)
+
     def test_capture_round_trips_unicode_whitespace_markdown_and_fence_runs(self) -> None:
         original = "\n  想法 😀 [[not a link]]\n````\ntrailing  \n"
         capture = guard.render_capture("mg-idea-1", original, "2026-09-13T00:00:00Z")

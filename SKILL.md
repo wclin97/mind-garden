@@ -132,6 +132,27 @@ and the exact new-file diff, then obtain fresh confirmation before persistence.
 5. Immediately guarded-read every successful write and verify its expected
    hash/structure. `move_expected` remains unsupported.
 
+## New content-note filename policy
+
+This policy applies **only to new content notes**: captures, standalone
+developments, and distillations. Choose a concise, human-readable title. Prefer
+Chinese when it accurately and naturally describes the idea; if Chinese would be
+awkward, vague, or distort a technical/proper term, use English or a natural mixed
+Chinese/English title. Never translate merely to satisfy the Chinese preference.
+
+Call `build_note_filename(title, note_id)` and use its exact
+`<readable-title>--mg-YYYYMMDD-HHMMSS.md` format, with the timestamp-bearing stable
+ID at the filename end. For example:
+`Y-T-W-L 肩胛稳定练习--mg-20260914-044626.md`. The stable ID also remains in
+frontmatter. A generated capture title/H1 is metadata outside **Original expression**
+and must not rewrite or alter its literal content or digest.
+
+Never automatically rename or move existing notes. Legacy ID-only filenames remain
+readable and writable through existing APIs; attachments keep content-hash filenames;
+and fixed review Markdown/Base names remain unchanged. On `ALREADY_EXISTS`, do not
+overwrite: use a new timestamp ID. If that changes a conservative distillation target,
+refresh its preview and obtain a new confirmation.
+
 ## Modes
 
 ### capture
@@ -140,8 +161,9 @@ A capture request may be expressed in ordinary natural language; the user does n
 need to say `capture` or propose a filename. Create a draft only when the request to
 save a durable thought is clear—do not capture unrelated conversation, acknowledgments,
 or spelling corrections. A clear request for a new capture may directly
-`exclusive_create` the proposed scope-relative `captures/<id>.md` path under
-`allowed_subdirectory`, then read it back. The **Original expression** is a dynamic
+`exclusive_create` the proposed scope-relative
+`captures/<readable-title>--<id>.md` path under `allowed_subdirectory`, then read it
+back. The **Original expression** is a dynamic
 fenced literal region containing the supplied text unchanged (including CJK, emoji,
 Markdown, fence runs, and leading/trailing whitespace). New captures contain empty
 managed `mind-garden:development` and `mind-garden:connections` regions. Compare the
@@ -161,8 +183,9 @@ read-back.
 
 Use a separate derivative for a substantial multi-source development or an explicit
 request for a standalone note. A clear request for a **new standalone development**
-may directly `exclusive_create` its scope-relative `developments/<id>.md` artifact and
-read it back without an extra preview/confirmation round. If it includes a validated
+may directly `exclusive_create` its scope-relative
+`developments/<readable-title>--<id>.md` artifact and read it back without an extra
+preview/confirmation round. If it includes a validated
 attachment bundle, `exclusive_create_development_bundle` remains the only write route;
 that new bundle receives the same direct-create exception. If a source changes before
 writing, return an unsaved draft.
@@ -172,8 +195,9 @@ most five structured host results without a per-query confirmation, and use only
 bounded cited evidence. It may ask the host to return at most three raster candidates;
 download failure, invalid bytes, no result, unavailable host, unsafe query, or a
 single-instruction `offline` override falls back to local development rather than
-blocking. Build `developments/<id>.md` with visible, path-qualified source links, each
-source SHA-256 provenance, and empty managed development and connections regions.
+blocking. Build `developments/<readable-title>--<id>.md` with visible,
+path-qualified source links, each source SHA-256 provenance, and empty managed
+development and connections regions.
 
 ### connect
 
@@ -200,7 +224,8 @@ Use sources named by the user or uniquely identified through guarded Vault-wide
 discovery; if the source set is ambiguous, show the candidates and ask rather than
 guessing. Sources remain unchanged wherever they live. Distillation is conservative:
 even for an unambiguous source set, show the complete source list with Vault-relative
-paths and SHA-256 hashes, the scope-relative `distillations/<id>.md` target under
+paths and SHA-256 hashes, the scope-relative
+`distillations/<readable-title>--<id>.md` target under
 `allowed_subdirectory`, and the exact new-file diff. Obtain fresh confirmation before
 exclusive creation and guarded read-back. A distillation never replaces or compresses
 its sources and contains complete source links, SHA-256 provenance, and empty managed

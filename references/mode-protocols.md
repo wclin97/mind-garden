@@ -47,8 +47,9 @@ A capture request may be expressed without the literal word `capture`. Create a 
 only when the user's intent to save a durable thought is clear; acknowledgments,
 corrections, and unrelated conversation are not captures. Preserve the supplied
 Original expression exactly in a dynamic literal fence. A clear request for a new
-capture may directly create the scope-relative `captures/<id>.md` path under
-`allowed_subdirectory` and read it back; do not add a preview/confirmation round.
+capture may directly create the scope-relative
+`captures/<readable-title>--<id>.md` path under `allowed_subdirectory` and read it
+back; do not add a preview/confirmation round.
 
 ## develop
 
@@ -60,7 +61,8 @@ append target or new derivative must have a scope-relative path under
 An append is a patch to an existing note. Before it persists, show the target,
 relevant SHA-256 hashes, and exact unified diff and obtain fresh confirmation. A clear
 request for a **new standalone development** may directly create its
-`developments/<id>.md` artifact and read it back. The same direct-create policy covers
+`developments/<readable-title>--<id>.md` artifact and read it back. The same
+direct-create policy covers
 its validated attachment bundle; the bundle still validates every active embed before
 mutation and writes attachments before the development.
 
@@ -92,9 +94,10 @@ Use sources named by the user or uniquely identified through guarded Vault-wide
 discovery. Sources remain unchanged wherever they live. If the source set is ambiguous,
 show the candidates and ask rather than guessing. Even when it is unambiguous,
 distillation remains conservative: show the complete source list with Vault-relative
-paths and SHA-256 hashes, the scope-relative `distillations/<id>.md` target under
-`allowed_subdirectory`, and the exact new-file diff, then obtain fresh confirmation
-before exclusive creation and guarded read-back.
+paths and SHA-256 hashes, the scope-relative
+`distillations/<readable-title>--<id>.md` target under `allowed_subdirectory`, and the
+exact new-file diff, then obtain fresh confirmation before exclusive creation and
+guarded read-back.
 
 ## review
 
